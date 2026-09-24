@@ -1,0 +1,12 @@
+__pycache__/
+*.pyc
+
+# build-appimage.sh output/scratch - regenerate with ./build-appimage.sh
+.appimage-build/
+.cache-appimage-tools/
+*.AppImage
+.gui-venv/
+
+# phBot is third-party software - it is downloaded, never committed
+# (a copy placed here for offline installs is still picked up).
+prebuilt/phBot-Installer.exe

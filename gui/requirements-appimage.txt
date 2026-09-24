@@ -1,0 +1,12 @@
+# Exact pins for build-appimage.sh - NOT for running the GUI from source (use
+# requirements.txt for that).
+#
+# The AppImage is frozen inside Ubuntu 20.04 (glibc 2.31) with its stock
+# Python 3.8 on purpose, so it runs on older still-in-use bases too (Debian
+# Bullseye, older ChromeOS Flex / Crostini containers). PySide6 6.6.3.1 is the
+# LAST release that supports Python 3.8 - an unpinned "PySide6" only happened
+# to resolve to it because pip skips newer ones on 3.8. Do not bump any of
+# these without re-running tests/smoke-appimage.sh against the oldest targets.
+PySide6==6.6.3.1
+pyinstaller==6.22.3
+pyinstaller-hooks-contrib==2026.7

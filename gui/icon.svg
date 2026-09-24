@@ -1,0 +1,8 @@
+<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 256 256"><defs>
+<linearGradient id="bg" x1="0" y1="0" x2="0" y2="1"><stop offset="0" stop-color="#1E2F4F"/><stop offset="1" stop-color="#0F1A2E"/></linearGradient>
+<linearGradient id="wine" x1="0" y1="0" x2="0" y2="1"><stop offset="0" stop-color="#D0415E"/><stop offset="1" stop-color="#6E1630"/></linearGradient>
+<linearGradient id="wineS" x1="0" y1="0" x2="1" y2="1"><stop offset="0" stop-color="#E0566F"/><stop offset="1" stop-color="#7A1A36"/></linearGradient>
+</defs><rect width="256" height="256" rx="56" fill="url(#bg)"/><path d="M176 66 C120 44 70 72 96 112 C114 140 170 124 164 164 C160 190 126 204 96 196" stroke="url(#wineS)" stroke-width="24" fill="none" stroke-linecap="round"/><path d="M176 66 C120 44 70 72 96 112 C114 140 170 124 164 164 C160 190 126 204 96 196" stroke="#F4C2CC" stroke-width="2.5" fill="none" stroke-dasharray="7 9" opacity=".75"/><circle cx="186" cy="62" r="22" fill="#16233D" stroke="#E6EDF3" stroke-width="4"/><path d="M175 54 L183 62 L175 70" stroke="#E6EDF3" stroke-width="4.5" fill="none" stroke-linecap="round" stroke-linejoin="round"/><path d="M187 71 H198" stroke="#E0566F" stroke-width="4.5" stroke-linecap="round"/><g transform="translate(70 186) scale(0.8)">
+<path d="M-26 -30 H26 C27 0 16 18 0 20 C-16 18 -27 0 -26 -30 Z" fill="none" stroke="#E6EDF3" stroke-width="8.8" stroke-linejoin="round"/>
+<path d="M-25 -8 C-12 -12 12 -4 25 -8 C22 8 12 18 0 19 C-12 18 -22 8 -25 -8 Z" fill="url(#wine)"/>
+<path d="M0 20 V48 M-18 51 H18" stroke="#E6EDF3" stroke-width="8.8" stroke-linecap="round"/></g></svg>
