@@ -33,6 +33,9 @@ PHBOT_MG="$SRO_HOME/phbot-maxiguard.sh"
 ASSETS="$SRO_HOME/assets"
 CLIENTS="$SRO_HOME/clients.tsv"     # lines: mode<TAB>label<TAB>folder
 RUNDIR="$SRO_HOME/run"              # one <id>.pid / <id>.info / <id>.log per instance
+REDIRECTS="$SRO_HOME/redirects.tsv" # lines: folder<TAB>enabled<TAB>gw_ip<TAB>gw_port<TAB>locale
+CLIENTINFO="$ASSETS/sro-clientinfo.py"   # reads locale/gateway/port from Media.pk2
+REDIR_LIB_DIR="$ASSETS/redir"       # sroredirect.so ($LIB/ for the matching arch)
 
 # Some hosts (VMs without GPU passthrough, e.g. plain QEMU/bochs-drm) have no
 # working Vulkan driver, so DXVK fails with "Failed to create Vulkan instance"
@@ -268,6 +271,132 @@ _client_add() {
 }
 _client_remove() { [ -f "$CLIENTS" ] || return 0; local tmp; tmp="$(mktemp)"; awk -F '\t' -v m="$1" -v f="$2" '!($1==m && $3==f)' "$CLIENTS" > "$tmp" 2>/dev/null || true; mv -f "$tmp" "$CLIENTS"; }
 
+# ============================================================ client info / locale
+# What the client itself would connect to and in which locale, read from its
+# Media.pk2 (DIVISIONINFO.TXT / GATEPORT.TXT) by sro-clientinfo.py. Cached per
+# folder for the life of this process - a pk2 read is cheap but not free, and
+# several helpers below want the same answer. Output is the raw key=value lines
+# the python prints (locale=, gateport=, division=, gateway=), or empty on
+# failure (missing pk2, or a server that re-keyed its archives).
+declare -A _CLIENTINFO_CACHE
+client_info() {   # $1 = client folder -> key=value lines on stdout (may be empty)
+    local folder="$1"
+    if [ -z "${_CLIENTINFO_CACHE[$folder]+x}" ]; then
+        local out=""
+        if [ -f "$CLIENTINFO" ] && command -v python3 >/dev/null 2>&1; then
+            out="$(python3 "$CLIENTINFO" "$folder" 2>/dev/null || true)"
+        fi
+        _CLIENTINFO_CACHE[$folder]="$out"
+    fi
+    printf '%s' "${_CLIENTINFO_CACHE[$folder]}"
+}
+_client_info_value() {   # $1=folder $2=key -> first value, or empty
+    client_info "$1" | sed -n "s/^$2=//p" | head -1
+}
+# The content locale to start the client with (the /NN in "sro_client.exe 0 /NN
+# 0 0"). A saved redirect entry may override it; otherwise it comes from the
+# pk2; otherwise fall back to 22 (the long-standing default this launcher used
+# before it could read the real one). Cyron, for instance, reads as 65.
+client_locale() {   # $1 = client folder
+    local folder="$1" ov loc
+    ov="$(_redirect_field "$folder" 5)"      # saved override, if any
+    [ -n "$ov" ] && { printf '%s' "$ov"; return 0; }
+    loc="$(_client_info_value "$folder" locale)"
+    printf '%s' "${loc:-22}"
+}
+
+# ============================================================ redirects
+# Per-client connection redirect (the Linux-native equivalent of
+# edxSilkroadLoader5's Redirect_Gateway): the client's gateway connection is
+# sent to a local bot proxy (phBot, RBC, ...) instead of the game server, via
+# an LD_PRELOAD connect() wrapper (sroredirect.so) scoped to the launched wine
+# process only. Stored one line per folder:
+#   folder <TAB> enabled(1/0) <TAB> proxy_ip <TAB> proxy_port <TAB> locale
+_redirect_field() {   # $1=folder $2=column(2..5) -> value or empty
+    [ -f "$REDIRECTS" ] || return 0
+    awk -F '\t' -v f="$1" -v c="$2" '$1==f {print $c; exit}' "$REDIRECTS" 2>/dev/null || true
+}
+redirect_enabled() { [ "$(_redirect_field "$1" 2)" = "1" ]; }
+_redirect_set() {   # $1=folder $2=enabled $3=proxy_ip $4=proxy_port $5=locale
+    mkdir -p "$SRO_HOME"
+    local tmp; tmp="$(mktemp)"
+    [ -f "$REDIRECTS" ] && awk -F '\t' -v f="$1" '$1!=f' "$REDIRECTS" > "$tmp" 2>/dev/null || true
+    printf '%s\t%s\t%s\t%s\t%s\n' "$1" "$2" "$3" "$4" "$5" >> "$tmp"
+    mv -f "$tmp" "$REDIRECTS"
+}
+_redirect_clear() {   # $1=folder
+    [ -f "$REDIRECTS" ] || return 0
+    local tmp; tmp="$(mktemp)"; awk -F '\t' -v f="$1" '$1!=f' "$REDIRECTS" > "$tmp" 2>/dev/null || true
+    mv -f "$tmp" "$REDIRECTS"
+}
+_resolve_ipv4() {   # $1=host -> unique IPv4 addresses, one per line
+    if command -v getent >/dev/null 2>&1; then
+        getent ahostsv4 "$1" 2>/dev/null | awk '{print $1}' | sort -u
+    elif command -v python3 >/dev/null 2>&1; then
+        python3 - "$1" <<'PY' 2>/dev/null || true
+import socket, sys
+try:
+    print("\n".join(sorted({ai[4][0] for ai in socket.getaddrinfo(sys.argv[1], None, socket.AF_INET)})))
+except OSError:
+    pass
+PY
+    fi
+}
+# Builds the LD_PRELOAD env for a redirect-enabled client and leaves it in the
+# REDIR_ENV array (empty when redirect is off or unusable). Rule set: each
+# resolved gateway IP on the client's gateway port -> the proxy; if no gateway
+# IP could be resolved, fall back to matching the gateway port on any address
+# (still scoped to this one client process, so it only ever affects its own
+# server connection). The preload path uses the glibc $LIB token so the right
+# 32-/64-bit build is picked per process; $2 lets the MaxiGuard path point at a
+# copy inside the (container-visible) prefix instead of $ASSETS.
+REDIR_ENV=()
+REDIR_NOTE=""
+_redirect_env() {   # $1=folder  $2=arch(64|32)  [$3=preload dir override]
+    REDIR_ENV=(); REDIR_NOTE=""
+    redirect_enabled "$1" || return 0
+    local arch="${2:-64}"
+    local proxy_ip proxy_port gate_port rules="" ip host
+    proxy_ip="$(_redirect_field "$1" 3)"; proxy_port="$(_redirect_field "$1" 4)"
+    [ -n "$proxy_ip" ] && [ -n "$proxy_port" ] || { REDIR_NOTE="redirect enabled but no proxy set - ignored"; return 0; }
+    gate_port="$(_client_info_value "$1" gateport)"
+    [ -n "$gate_port" ] || { REDIR_NOTE="redirect: client gateway port unknown - ignored"; return 0; }
+    local -a ips=()
+    # `|| [ -n "$host" ]` so the final line is still processed when client_info
+    # (cached through a $(...) that strips the trailing newline) ends without
+    # one - otherwise the last, and for single-gateway clients like Cyron the
+    # ONLY, gateway host is silently dropped and every redirect falls back to
+    # the any-address rule.
+    while IFS= read -r host || [ -n "$host" ]; do
+        [ -n "$host" ] || continue
+        while IFS= read -r ip || [ -n "$ip" ]; do [ -n "$ip" ] && ips+=("$ip"); done < <(_resolve_ipv4 "$host")
+    done < <(client_info "$1" | sed -n 's/^gateway=//p')
+    if [ "${#ips[@]}" -gt 0 ]; then
+        for ip in "${ips[@]}"; do rules+="${ip},${gate_port}=${proxy_ip},${proxy_port};"; done
+    else
+        rules="*,${gate_port}=${proxy_ip},${proxy_port};"
+        REDIR_NOTE="redirect: gateway host did not resolve - matching gateway port on any address"
+    fi
+    # Pick the build matching the arch of the process that will call connect():
+    # the native wine-sro loader is a 64-bit process (new WoW64 runs the 32-bit
+    # PE inside it), while GE-Proton runs a 32-bit client in a real 32-bit
+    # process. The glibc $LIB token is not portable enough for this (on Arch it
+    # does not map to lib64/lib the way it does on Debian), so choose the path
+    # explicitly. Fall back to the other arch if only one was built.
+    # No cross-arch fallback: a wrong-arch .so can never load into the process
+    # (the loader would only print an ELFCLASS error into the log), so if the
+    # matching build is missing, redirect is simply unavailable for this client.
+    local dir="${3:-$REDIR_LIB_DIR}" preload
+    if [ "$arch" = 32 ]; then preload="$dir/lib/sroredirect.so"
+    else preload="$dir/lib64/sroredirect.so"; fi
+    if [ ! -f "$preload" ]; then
+        REDIR_NOTE="redirect: sroredirect.so (${arch}-bit) not built - ignored (install 32-bit gcc/multilib for MaxiGuard)"
+        return 0
+    fi
+    # LD_PRELOAD is appended (not overwritten) in case Proton/umu set their own.
+    REDIR_ENV=(LD_PRELOAD="${preload}${LD_PRELOAD:+ $LD_PRELOAD}" SROREDIR_RULES="$rules")
+}
+
 # ============================================================ file browser
 # Deliberately duplicated from lib/common.sh instead of sourced: this file is
 # installed by copying it verbatim to $SRO_HOME/sro.sh (see
@@ -292,6 +421,16 @@ _ci_file() {   # $1=dir $2=name -> real on-disk filename, or nothing (exit 1)
 }
 
 detect_client() { local d="$1" e m; for e in sro_client.exe Macro_Client.exe Silkroad.exe Client.exe; do m="$(_ci_file "$d" "$e")" && { echo "$m"; return 0; }; done; echo ""; }
+
+# The server name for a running client process: its working directory is the
+# client folder (launch_bg cd's into it, and a client its own launcher spawned
+# inherits that too), so basename(/proc/PID/cwd) is the folder/server name -
+# but only when that folder really holds a Silkroad client, so phBot/Manager
+# (whose cwd is their own dir) never get mislabelled. Empty otherwise.
+_client_server_name() {   # $1 = pid
+    local cwd; cwd="$(readlink "/proc/$1/cwd" 2>/dev/null)" || return 0
+    [ -n "$cwd" ] && [ -n "$(detect_client "$cwd")" ] && basename "$cwd"
+}
 
 SELECTED=""
 browse() {
@@ -485,7 +624,16 @@ _build_candidates() {
         skip=0
         for j in "${!CAND_PID[@]}"; do [ "${CAND_PID[j]}" = "$pid2" ] && { skip=1; break; }; done
         [ "$skip" = 1 ] && continue
-        CAND_PID+=("$pid2"); CAND_LABEL+=("${C_HEAD}${lbl2}${C_R}   ${C_HINT}pid ${pid2}${C_R}")
+        # For a bare client process (e.g. one a launcher/phBot spawned, shown
+        # only as "sro_client.exe"), lead with the server name so the row is
+        # tellable from other clients; keep the exe + pid as the dim hint.
+        local srv2; srv2="$(_client_server_name "$pid2")"
+        if [ -n "$srv2" ]; then
+            CAND_LABEL+=("${C_HEAD}${srv2}${C_R}   ${C_HINT}${lbl2} · pid ${pid2}${C_R}")
+        else
+            CAND_LABEL+=("${C_HEAD}${lbl2}${C_R}   ${C_HINT}pid ${pid2}${C_R}")
+        fi
+        CAND_PID+=("$pid2")
         CAND_KIND+=("foreign"); CAND_REF+=("pid:$pid2"); CAND_SID+=("$sid2")
         CAND_RANK+=("$(_job_rank_for_comm "$comm2")")
         CAND_PFX+=("$(_cand_wineprefix "$pid2")"); CAND_START+=("$(_cand_starttime "$pid2")")
@@ -697,6 +845,104 @@ stop_id() {
     rm -f "$base.pid" "$base.info"
 }
 
+# ============================================================ client windows
+# Show/hide a running client's window and put its server name (the client
+# folder's name) in the title bar, so several clients running at once are
+# tellable apart. Implemented with xdotool/xprop on X11 (Wine runs on X11,
+# also under XWayland). Everything here is best-effort: without xdotool, or
+# for a MaxiGuard client whose Proton container hides its pids, the ops simply
+# do nothing and the GUI reports "no window".
+#
+# A client instance is identified by its SESSION id: launch_bg starts each one
+# under its own setsid session, and the process that actually owns the X window
+# (a Wine child, reparented away from us) still shares that session id - unlike
+# the WINEPREFIX, which plain/vSroPlus clients share per mode. Managed
+# top-level windows are the ones carrying a WM_CLASS (that property survives an
+# unmap, so a hidden window can still be found and shown again; WM_STATE does
+# not).
+_have_xdotool() { command -v xdotool >/dev/null 2>&1; }
+
+# ref (as printed by --list-json) -> the pid to derive the session from.
+# "pid:<n>" is a foreign job; anything else is a tracked job's base path.
+_ref_to_pid() {
+    case "$1" in
+        pid:*) printf '%s' "${1#pid:}" ;;
+        *)     cat "$1.pid" 2>/dev/null ;;
+    esac
+}
+_ref_to_sid() {   # ref -> session id (empty if the process is gone)
+    local pid; pid="$(_ref_to_pid "$1")"
+    [ -n "$pid" ] || return 0
+    ps -o sid= -p "$pid" 2>/dev/null | tr -d ' '
+}
+_win_session_pids() { [ -n "$1" ] && pgrep -s "$1" 2>/dev/null; }
+# All managed top-level windows of a session (deduplicated). Managed = carries
+# a WM_CLASS, which excludes tooltips/IME helpers and, crucially, persists
+# while the window is unmapped.
+_win_managed() {   # $1 = sid
+    local p w; declare -A seen=()
+    for p in $(_win_session_pids "$1"); do
+        for w in $(xdotool search --pid "$p" 2>/dev/null); do
+            [ -n "${seen[$w]:-}" ] && continue
+            seen[$w]=1
+            xprop -id "$w" WM_CLASS 2>/dev/null | grep -q '^WM_CLASS' && printf '%s\n' "$w"
+        done
+    done
+}
+_win_visible() {   # $1 = sid -> currently mapped window ids
+    local p
+    for p in $(_win_session_pids "$1"); do xdotool search --onlyvisible --pid "$p" 2>/dev/null; done | sort -u
+}
+# Prints none | shown | hidden for a session's client windows.
+window_state_for_sid() {
+    local sid="$1" managed vis w
+    _have_xdotool || { echo none; return 0; }
+    managed="$(_win_managed "$sid")"
+    [ -n "$managed" ] || { echo none; return 0; }
+    vis=" $(_win_visible "$sid" | tr '\n' ' ') "
+    for w in $managed; do
+        case "$vis" in *" $w "*) echo shown; return 0 ;; esac
+    done
+    echo hidden
+}
+hide_windows_for_sid() {   # unmap the currently-visible managed windows
+    local sid="$1" vis=" $(_win_visible "$1" | tr '\n' ' ') " w done=0
+    for w in $(_win_managed "$sid"); do
+        case "$vis" in *" $w "*) xdotool windowunmap "$w" 2>/dev/null && done=1 ;; esac
+    done
+    return $((done ? 0 : 1))
+}
+show_windows_for_sid() {   # map the managed windows that are not currently visible
+    local sid="$1" vis=" $(_win_visible "$1" | tr '\n' ' ') " w done=0
+    for w in $(_win_managed "$sid"); do
+        case "$vis" in
+            *" $w "*) : ;;
+            *) xdotool windowmap "$w" 2>/dev/null && { xdotool windowactivate "$w" 2>/dev/null || true; done=1; } ;;
+        esac
+    done
+    return $((done ? 0 : 1))
+}
+tag_windows_for_sid() {   # $1=sid $2=title : name every managed window
+    local sid="$1" name="$2" w done=1
+    for w in $(_win_managed "$sid"); do
+        xdotool set_window --name "$name" "$w" 2>/dev/null && done=0
+    done
+    return "$done"
+}
+# Fire-and-forget: wait (briefly) for a client's window to appear after launch,
+# then put the server name on it. Detached so it never delays the start.
+_tag_session_bg() {   # $1=sid $2=title
+    _have_xdotool || return 0
+    [ -n "$1" ] && [ -n "$2" ] || return 0
+    ( local i w
+      for i in $(seq 1 60); do          # up to ~30s
+          w="$(_win_managed "$1" | head -1)"
+          [ -n "$w" ] && { tag_windows_for_sid "$1" "$2"; break; }
+          sleep 0.5
+      done ) >/dev/null 2>&1 &
+    disown 2>/dev/null || true
+}
+
 # ============================================================ launch helpers
 find_ge() {
     local d b p
@@ -900,6 +1146,7 @@ find_manager_exe() {   # prints the installed Manager.exe (or empty)
 start_silkroad_headless() {   # $1=mode $2=folder $3=label ; rest = exe [args...]
     HEADLESS_ERR=""
     local mode="$1" folder="$2" label="$3"; shift 3
+    REDIR_ENV=(); REDIR_NOTE=""
     if [ "$mode" = maxiguard ]; then
         local ge; ge="$(find_ge)" || { HEADLESS_ERR="No patched GE-Proton *-SRO build found. Run once: ./swe.sh --skip-deps --skip-wine --maxiguard \"$folder\""; return 1; }
         local umu; umu="$(umu_bin)" || { HEADLESS_ERR="umu-run not found (package: umu-launcher). Run once: ./swe.sh --skip-deps --skip-wine --maxiguard (auto-installs it), or install it manually."; return 1; }
@@ -915,6 +1162,13 @@ start_silkroad_headless() {   # $1=mode $2=folder $3=label ; rest = exe [args...
         # Hosts without a working Vulkan driver (VMs without GPU passthrough) need
         # WineD3D instead of DXVK - opt-in via 'Toggle: force WineD3D' in swe.sh.
         local wined3d_env=(); wined3d_forced && wined3d_env=(PROTON_USE_WINED3D=1)
+        # Redirect (best effort under Proton/pressure-vessel): the preload has
+        # to be visible INSIDE the container, so copy it into the prefix (which
+        # umu bind-mounts) and point the rule builder there. If LD_PRELOAD does
+        # not survive into the container the client just connects normally - the
+        # activation line the preload logs is how you can confirm it took.
+        mg_ensure_redirect_lib "$pfx"
+        _redirect_env "$folder" 32 "$pfx/drive_c/sroredirect"
         # Launch via umu-run (GE-Proton + Steam Linux Runtime): the ONLY combo that
         # both passes MaxiGuard's VM check AND survives world entry. Running GE Wine
         # directly passes the VM check but crashes when the client resets the device
@@ -922,6 +1176,7 @@ start_silkroad_headless() {   # $1=mode $2=folder $3=label ; rest = exe [args...
         launch_bg "$label" "$folder" \
             env WINEPREFIX="$pfx" GAMEID="umu-sro" STORE=none PROTONPATH="$ge" \
                 PROTON_DISABLE_NVAPI=1 WINE_HIDE_WINE_EXPORTS=1 "${wined3d_env[@]}" \
+                "${REDIR_ENV[@]}" \
                 "$umu" cmd /c "reg delete HKLM\\Software\\Wine /f & $mgcmd"
     else
         [ -x "$WSRO_LOADER" ] || { HEADLESS_ERR="wine-sro missing ($WSRO_LOADER)."; return 1; }
@@ -933,11 +1188,29 @@ start_silkroad_headless() {   # $1=mode $2=folder $3=label ; rest = exe [args...
                 WINEPREFIX="$1" "$3" -w 2>/dev/null
             ' _ "$pfx" "$WSRO_LOADER" "$WSRO_SERVER"
         fi
+        _redirect_env "$folder" 64
         launch_bg "$label" "$folder" \
             env WINEPREFIX="$pfx" WINELOADER="$WSRO_LOADER" WINESERVER="$WSRO_SERVER" \
-                WINEARCH=win64 WINEDEBUG=-all "$WSRO_LOADER" "$@"
+                WINEARCH=win64 WINEDEBUG=-all "${REDIR_ENV[@]}" "$WSRO_LOADER" "$@"
     fi
+    # Put the server name (the client folder's name) on the client's window
+    # title, once its window shows up - so multiple running clients are
+    # distinguishable. Detached and best-effort (see the client-windows section).
+    [ -n "${LAST_PID:-}" ] && _tag_session_bg "$(ps -o sid= -p "$LAST_PID" 2>/dev/null | tr -d ' ')" "$(basename "$folder")"
     return 0
+}
+
+# Copy the redirect preload into a MaxiGuard prefix so umu/pressure-vessel can
+# load it from a path that exists inside the container (see _redirect_env's
+# best-effort note). No-op when the assets are not built.
+mg_ensure_redirect_lib() {   # $1 = prefix
+    local dst="$1/drive_c/sroredirect" a
+    [ -d "$REDIR_LIB_DIR" ] || return 0
+    for a in lib lib64; do
+        [ -f "$REDIR_LIB_DIR/$a/sroredirect.so" ] || continue
+        mkdir -p "$dst/$a"
+        cp -f "$REDIR_LIB_DIR/$a/sroredirect.so" "$dst/$a/sroredirect.so" 2>/dev/null || true
+    done
 }
 
 start_silkroad() {
@@ -1165,13 +1438,14 @@ start_flow() {
     local cexe; cexe="$(detect_client "$FOLDER")"
     [ -n "$cexe" ] || { frame_msg "Error" "No Silkroad client in '$FOLDER'."; return 0; }
 
-    menu "What to start?" "Launcher (Silkroad.exe)" "Client   ($cexe  0 /22 0 0)" || return 0
+    local loc; loc="$(client_locale "$FOLDER")"
+    menu "What to start?" "Launcher (Silkroad.exe)" "Client   ($cexe  0 /$loc 0 0)" || return 0
     local lbl="$(mode_label "$MODE"): $CLABEL"
     local launcher_exe; launcher_exe="$(_ci_file "$FOLDER" "Silkroad.exe")"
     if [ "$MENU_IDX" = 0 ] && [ -n "$launcher_exe" ]; then
         start_silkroad "$MODE" "$FOLDER" "$lbl (launcher)" "$launcher_exe"
     else
-        start_silkroad "$MODE" "$FOLDER" "$lbl" "$cexe" 0 /22 0 0
+        start_silkroad "$MODE" "$FOLDER" "$lbl" "$cexe" 0 "/$loc" 0 0
     fi
 }
 
@@ -1320,15 +1594,25 @@ if [ "${BASH_SOURCE[0]}" = "${0}" ]; then
         _render_tree_order
         printf '['
         _json_first=1
+        declare -A _json_wstate=()   # sid -> none|shown|hidden, computed once per session
         for _json_ri in "${!RENDER_IDX[@]}"; do
             _json_idx="${RENDER_IDX[_json_ri]}"
             _json_plain="$(printf '%s' "${CAND_LABEL[_json_idx]}" | sed 's/\x1b\[[0-9;]*m//g')"
             _json_hc=false; _cand_has_children "$_json_idx" && _json_hc=true
+            # Window state for the "(hidden)" marker. Sessions are shared within
+            # a job tree, so cache per sid to keep the every-few-seconds refresh
+            # from re-running xdotool for each nested row.
+            _json_sid="${CAND_SID[_json_idx]}"
+            [ -n "$_json_sid" ] || _json_sid="$(ps -o sid= -p "${CAND_PID[_json_idx]}" 2>/dev/null | tr -d ' ')"
+            if [ -z "${_json_wstate[$_json_sid]+x}" ]; then
+                _json_wstate[$_json_sid]="$(window_state_for_sid "$_json_sid")"
+            fi
+            _json_hidden=false; [ "${_json_wstate[$_json_sid]}" = hidden ] && _json_hidden=true
             [ "$_json_first" = 1 ] || printf ','
             _json_first=0
-            printf '{"ref":"%s","label":"%s","kind":"%s","depth":%s,"has_children":%s,"pid":"%s"}' \
+            printf '{"ref":"%s","label":"%s","kind":"%s","depth":%s,"has_children":%s,"pid":"%s","hidden":%s}' \
                 "$(_json_esc "${CAND_REF[_json_idx]}")" "$(_json_esc "$_json_plain")" "${CAND_KIND[_json_idx]}" \
-                "${RENDER_DEPTH[$_json_idx]}" "$_json_hc" "${CAND_PID[_json_idx]}"
+                "${RENDER_DEPTH[$_json_idx]}" "$_json_hc" "${CAND_PID[_json_idx]}" "$_json_hidden"
         done
         printf ']\n'
         exit 0
@@ -1374,6 +1658,65 @@ if [ "${BASH_SOURCE[0]}" = "${0}" ]; then
         echo "removed"
         exit 0
     fi
+    # What the client would connect to and in which locale (read from its
+    # Media.pk2). Used by the GUI to decide whether Redirect is possible for a
+    # client and to pre-fill the form. Prints key=value lines; exit 1 (nothing
+    # on stdout) when the pk2 cannot be read - e.g. a custom-keyed archive.
+    if [ "${1:-}" = "--client-info" ]; then
+        [ -n "${2:-}" ] || { echo "usage: sro.sh --client-info <folder>" >&2; exit 1; }
+        _ci_out="$(client_info "$2")"
+        [ -n "$_ci_out" ] || { echo "client info unavailable (no readable Media.pk2)" >&2; exit 1; }
+        printf '%s\n' "$_ci_out"
+        exit 0
+    fi
+    # Saved redirect for a client: prints  enabled<TAB>proxy_ip<TAB>proxy_port<TAB>locale
+    # (a blank line when none is saved).
+    if [ "${1:-}" = "--get-redirect" ]; then
+        [ -n "${2:-}" ] || { echo "usage: sro.sh --get-redirect <folder>" >&2; exit 1; }
+        printf '%s\t%s\t%s\t%s\n' "$(_redirect_field "$2" 2)" "$(_redirect_field "$2" 3)" \
+            "$(_redirect_field "$2" 4)" "$(_redirect_field "$2" 5)"
+        exit 0
+    fi
+    if [ "${1:-}" = "--set-redirect" ]; then
+        [ -n "${2:-}" ] && [ -n "${3:-}" ] \
+            || { echo "usage: sro.sh --set-redirect <folder> <enabled 0|1> <proxy_ip> <proxy_port> [locale]" >&2; exit 1; }
+        _redirect_set "$2" "$3" "${4:-}" "${5:-}" "${6:-}"
+        echo "saved"
+        exit 0
+    fi
+    if [ "${1:-}" = "--clear-redirect" ]; then
+        [ -n "${2:-}" ] || { echo "usage: sro.sh --clear-redirect <folder>" >&2; exit 1; }
+        _redirect_clear "$2"
+        echo "cleared"
+        exit 0
+    fi
+    # Client-window control for the Manage screen (ref values come from
+    # --list-json). All best-effort: they print "none" / do nothing when the
+    # job has no reachable window (no xdotool, or a Proton-contained MaxiGuard
+    # client). --window-state prints none|shown|hidden.
+    if [ "${1:-}" = "--window-state" ]; then
+        [ -n "${2:-}" ] || { echo "usage: sro.sh --window-state <ref>" >&2; exit 1; }
+        window_state_for_sid "$(_ref_to_sid "$2")"
+        exit 0
+    fi
+    if [ "${1:-}" = "--hide-window" ]; then
+        [ -n "${2:-}" ] || { echo "usage: sro.sh --hide-window <ref>" >&2; exit 1; }
+        _have_xdotool || { echo "xdotool not installed - cannot hide windows" >&2; exit 1; }
+        if hide_windows_for_sid "$(_ref_to_sid "$2")"; then echo "hidden"; else echo "no visible window to hide" >&2; exit 1; fi
+        exit 0
+    fi
+    if [ "${1:-}" = "--show-window" ]; then
+        [ -n "${2:-}" ] || { echo "usage: sro.sh --show-window <ref>" >&2; exit 1; }
+        _have_xdotool || { echo "xdotool not installed - cannot show windows" >&2; exit 1; }
+        if show_windows_for_sid "$(_ref_to_sid "$2")"; then echo "shown"; else echo "no hidden window to show" >&2; exit 1; fi
+        exit 0
+    fi
+    if [ "${1:-}" = "--tag-window" ]; then
+        [ -n "${2:-}" ] && [ -n "${3:-}" ] || { echo "usage: sro.sh --tag-window <ref> <title>" >&2; exit 1; }
+        _have_xdotool || { echo "xdotool not installed" >&2; exit 1; }
+        if tag_windows_for_sid "$(_ref_to_sid "$2")" "$3"; then echo "tagged"; else echo "no window to tag" >&2; exit 1; fi
+        exit 0
+    fi
     if [ "${1:-}" = "--start-phbot" ]; then
         [ -n "${2:-}" ] || { echo "usage: sro.sh --start-phbot <plain|vsroplus|maxiguard>" >&2; exit 1; }
         if start_phbot_headless "$2" && wait_started_headless "phBot"; then
@@ -1416,7 +1759,8 @@ if [ "${BASH_SOURCE[0]}" = "${0}" ]; then
         if [ "$_sc_which" = launcher ] && [ -n "$_sc_launcher_exe" ]; then
             start_silkroad_headless "$_sc_mode" "$_sc_folder" "$_sc_label (launcher)" "$_sc_launcher_exe"
         else
-            start_silkroad_headless "$_sc_mode" "$_sc_folder" "$_sc_label" "$_sc_exe" 0 /22 0 0
+            _sc_loc="$(client_locale "$_sc_folder")"
+            start_silkroad_headless "$_sc_mode" "$_sc_folder" "$_sc_label" "$_sc_exe" 0 "/$_sc_loc" 0 0
         fi
         if [ $? -eq 0 ] && wait_started_headless "$_sc_label"; then
             echo "started (log: $LAST_LOG)"; exit 0

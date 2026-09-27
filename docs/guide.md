@@ -255,11 +255,42 @@ entry from the list. The client's files are not touched.
 
 ## Starting phBot, the Manager and your clients
 
-**Your clients** (Launch → Silkroad Client) have up to two buttons each:
+**Your clients** (Launch → Silkroad Client) have up to two start buttons each:
 
-- **Client** starts the game client directly.
+- **Client** starts the game client directly. It is always started in the
+  client's own **content locale**, which the app reads from the client's
+  `Media.pk2` (for example `sro_client.exe 0 /65 0 0` for a locale-65 client) -
+  so you no longer have to care that older versions always used `/22`.
 - **Launcher** starts the client's own launcher (`Silkroad.exe`), e.g. to patch
   the client or log in through it. It only appears if the folder has one.
+
+### Redirect (playing through a bot proxy)
+
+Each client also has a **Redirect** button. It does the same thing
+edxSilkroadLoader5's *Redirect Gateway* option does: it sends the client's
+gateway connection to a local bot proxy (phBot, RBC, …) instead of straight to
+the game server, so you can run the client together with your proxy.
+
+Click **Redirect** to open the form:
+
+![The Redirect form](images/launch-redirect.png)
+
+- **Enable redirect** turns it on for this client.
+- **Proxy IP** / **Proxy port** is where the connection goes - usually
+  `127.0.0.1` and the port your proxy listens on (pre-filled with the client's
+  own gateway port).
+- **Locale** is the locale the client starts in. It is read from the client's
+  `Media.pk2`; leave it unless you have a reason to change it.
+
+The detected division, gateway host and gateway port are shown at the top so
+you can see what is being redirected. A client whose `Media.pk2` uses a custom
+encryption key can't be read, so its Redirect button is greyed out.
+
+When redirect is on, the button shows a check mark and its tooltip lists the
+target. Redirect works for **Plain** and **vSroPlus** clients; for
+**MaxiGuard** it is attempted too, but because those run inside a Proton
+container it is best-effort - check the client's log (the output drawer) for a
+`[sroredirect]` line to confirm it took effect.
 
 **phBot** and the **phBot Manager** have their own tabs:
 
@@ -305,10 +336,26 @@ list refreshes every few seconds.
 
 - **Stop selected** stops the selected program **and everything under it**.
 - **Stop ALL** stops everything in the list.
+- **Hide window / Show window** hides the selected program's window and brings
+  it back later. The button follows the selected row - it reads *Show window*
+  when that program is currently hidden. Hiding is a real hide (the window
+  disappears completely, not just minimised); the program keeps running, and a
+  hidden window stays hidden even if you close and reopen the app - just select
+  it again and click *Show window*. A hidden program is marked **(hidden)** in
+  the list.
+
+Running clients are listed by their **server name** (taken from the client's
+folder) instead of the bare `sro_client.exe`, so several clients at once are
+easy to tell apart. Each client's window title is set to the same name.
 
 The nesting is inferred (same Wine environment, start order), so with many
 similar programs at once it can occasionally group something differently than
 expected.
+
+> The hide/show and title features use `xdotool` (installed automatically
+> during setup). They work for **Plain** and **vSroPlus** clients; for
+> **MaxiGuard** the window may be unreachable from outside its Proton
+> container, in which case the button is greyed out.
 
 ## Updates
 

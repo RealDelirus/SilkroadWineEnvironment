@@ -1591,6 +1591,35 @@ def read_clients():
     return rows
 
 
+def client_info(folder: str) -> dict | None:
+    """What the client would connect to and in which locale, from its
+    Media.pk2 (sro.sh --client-info). None when the pk2 cannot be read (e.g.
+    a server that re-keyed its archives) - the Redirect button is disabled for
+    those, since there is nothing to pre-fill or match against."""
+    rc, out, _ = run_sro_sh(["--client-info", folder])
+    if rc != 0 or not out.strip():
+        return None
+    info: dict = {"gateways": []}
+    for line in out.splitlines():
+        if "=" not in line:
+            continue
+        key, val = line.split("=", 1)
+        if key == "gateway":
+            info["gateways"].append(val)
+        elif key in ("locale", "gateport"):
+            info[key] = int(val) if val.isdigit() else val
+        elif key == "division":
+            info.setdefault("division", val)   # first division is enough for the form
+    return info
+
+
+def get_redirect(folder: str):
+    """(enabled: bool, proxy_ip, proxy_port, locale) as saved by sro.sh."""
+    rc, out, _ = run_sro_sh(["--get-redirect", folder])
+    parts = (out.rstrip("\n").split("\t") + ["", "", "", ""])[:4] if rc == 0 else ["", "", "", ""]
+    return parts[0] == "1", parts[1], parts[2], parts[3]
+
+
 def available_modes() -> dict:
     """{'plain': True, 'vsroplus': bool, 'maxiguard': bool} - mirrors the TUI's
     pick_mode(), which only ever offers a mode that is actually usable (e.g.
@@ -1844,6 +1873,37 @@ class ClientPane(QWidget):
                 gap = QWidget()
                 gap.setFixedWidth(self.START_BTN_WIDTH)
                 card.add_action(gap)
+            # Redirect: send this client's gateway connection to a local bot
+            # proxy (phBot, RBC, ...) and start it in its real locale. Only
+            # offered when the client's Media.pk2 is readable (custom-keyed
+            # archives have nothing to pre-fill or match) - see client_info().
+            info = client_info(folder)
+            redirect_btn = QPushButton("Redirect")
+            redirect_btn.setFixedWidth(self.START_BTN_WIDTH)
+            redirect_btn.setCursor(Qt.PointingHandCursor)
+            if info is None:
+                redirect_btn.setEnabled(False)
+                redirect_btn.setIcon(theme.icon("arrow-right", theme.TEXT_DIM, 14))
+                redirect_btn.setToolTip(
+                    "Redirect needs this client's Media.pk2 to be readable.\n"
+                    "This client uses a custom-keyed archive, so the gateway\n"
+                    "and locale cannot be read from it.")
+            else:
+                enabled, rip, rport, rloc = get_redirect(folder)
+                redirect_btn.setIcon(theme.icon(
+                    "arrow-right", theme.ACCENT if enabled else theme.TEXT, 14))
+                if enabled:
+                    redirect_btn.setText("Redirect ✓")
+                    redirect_btn.setToolTip(
+                        "Redirecting gateway to %s:%s (locale %s).\nClick to change."
+                        % (rip, rport, rloc or info.get("locale")))
+                else:
+                    redirect_btn.setToolTip("Redirect this client to a local bot proxy")
+                redirect_btn.clicked.connect(
+                    lambda checked=False, f=folder, n=label, i=info:
+                        self.open_redirect(f, n, i))
+            card.add_action(redirect_btn)
+
             remove_btn = QPushButton()
             remove_btn.setProperty("variant", "danger")
             remove_btn.setToolTip("Remove this saved client")
@@ -1900,6 +1960,25 @@ class ClientPane(QWidget):
         else:
             QMessageBox.warning(self, "Could not add client", err or "unknown error")
         self.reload_clients()
+
+    def open_redirect(self, folder: str, name: str, info: dict):
+        current = get_redirect(folder)
+        dlg = widgets.RedirectDialog(self, name, info, current)
+        if dlg.exec() and dlg.accepted_choice:
+            enabled, ip, port, locale = dlg.values()
+            rc, out, err = run_sro_sh(["--set-redirect", folder, enabled, ip, port, locale])
+            if rc == 0:
+                if enabled == "1":
+                    self.status_panel.flash("done", "Redirect saved",
+                                            "%s → %s:%s" % (name, ip, port))
+                else:
+                    self.status_panel.flash("done", "Redirect off", name)
+                self.log.appendPlainText(
+                    "Redirect %s for %s: %s:%s locale=%s"
+                    % ("on" if enabled == "1" else "off", name, ip, port, locale or "auto"))
+            else:
+                QMessageBox.warning(self, "Could not save redirect", err or "unknown error")
+            self.reload_clients()
 
     def remove_client(self, mode: str, folder: str):
         if QMessageBox.question(self, "Remove client",
@@ -1998,6 +2077,14 @@ class ManageTab(QWidget):
         # Short label + tooltip rather than spelling the cascade out inline:
         # the full sentence made this row alone ~620px wide, which is more
         # than the whole content area has at the 600px minimum window size.
+        # Hide/show the selected job's window (client, phBot, Manager - anything
+        # with a window). The label follows the selected row's current window
+        # state; disabled when the row has no reachable window.
+        self.win_btn = QPushButton("Hide window")
+        self.win_btn.setProperty("variant", "ghost")
+        self.win_btn.setToolTip("Hide or show the selected program's window")
+        self.win_btn.setEnabled(False)
+        self.win_btn.clicked.connect(self.toggle_window)
         stop_btn = QPushButton("Stop selected")
         stop_btn.setToolTip("Stops the selected row and everything it started")
         stop_btn.clicked.connect(self.stop_selected)
@@ -2005,15 +2092,61 @@ class ManageTab(QWidget):
         stop_all_btn.setProperty("variant", "danger")
         stop_all_btn.clicked.connect(self.stop_all)
         btn_row.addWidget(refresh_btn)
+        btn_row.addWidget(self.win_btn)
         btn_row.addStretch(1)
         btn_row.addWidget(stop_btn)
         btn_row.addWidget(stop_all_btn)
         layout.addLayout(btn_row)
 
+        self.tree.currentItemChanged.connect(lambda *_: self._update_win_btn())
+
         self.timer = QTimer(self)
         self.timer.timeout.connect(self.reload)
         self.timer.start(5000)
         self.reload()
+
+    def _window_state(self, ref: str) -> str:
+        """none | shown | hidden - whether the job has a hideable window."""
+        rc, out, _ = run_sro_sh(["--window-state", ref])
+        return out if rc == 0 and out in ("shown", "hidden") else "none"
+
+    def _update_win_btn(self):
+        item = self.tree.currentItem()
+        ref = item.data(0, Qt.UserRole) if item else None
+        if not ref:
+            self.win_btn.setEnabled(False)
+            self.win_btn.setText("Hide window")
+            return
+        state = self._window_state(ref)
+        if state == "none":
+            self.win_btn.setEnabled(False)
+            self.win_btn.setText("Hide window")
+            self.win_btn.setToolTip(
+                "This program has no window to hide here.\n"
+                "(needs xdotool; a MaxiGuard client's window may be unreachable "
+                "from outside its Proton container.)")
+        else:
+            self.win_btn.setEnabled(True)
+            self.win_btn.setText("Show window" if state == "hidden" else "Hide window")
+            self.win_btn.setToolTip("Hide or show the selected program's window")
+
+    def toggle_window(self):
+        item = self.tree.currentItem()
+        if not item:
+            return
+        ref = item.data(0, Qt.UserRole)
+        state = self._window_state(ref)
+        if state == "none":
+            self._update_win_btn()
+            return
+        flag = "--show-window" if state == "hidden" else "--hide-window"
+        rc, out, err = run_sro_sh([flag, ref])
+        label = strip_ansi(item.text(0))
+        if rc == 0:
+            self.log.appendPlainText("%s: %s" % (label, out))
+        else:
+            QMessageBox.warning(self, "Window", err or "unknown error")
+        self._update_win_btn()
 
     def _list_json(self):
         rc, out, _ = run_sro_sh(["--list-json"])
@@ -2032,8 +2165,15 @@ class ManageTab(QWidget):
         entries = self._list_json()
         stack: list[tuple[int, QTreeWidgetItem]] = []
         for e in entries:
-            item = QTreeWidgetItem([e["label"], e.get("pid", "")])
+            label = e["label"]
+            if e.get("hidden"):
+                label += "   (hidden)"
+            item = QTreeWidgetItem([label, e.get("pid", "")])
             item.setData(0, Qt.UserRole, e["ref"])
+            if e.get("hidden"):
+                # Dim a hidden row so it reads as "still running, just not shown".
+                item.setForeground(0, QColor(theme.TEXT_MUTED))
+                item.setForeground(1, QColor(theme.TEXT_MUTED))
             depth = e.get("depth", 0)
             while stack and stack[-1][0] >= depth:
                 stack.pop()

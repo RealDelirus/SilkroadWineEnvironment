@@ -51,13 +51,16 @@ CLIENTS = [("maxiguard", "Athens 80 Cap", GAMES + "/Athens 80 Cap"),
            ("maxiguard", "Eternal Online", GAMES + "/Eternal Online"),
            ("maxiguard", "Legion SRO", GAMES + "/Legion SRO")]
 HAS_LAUNCHER = {GAMES + "/Athens 80 Cap", GAMES + "/Eternal Online"}
+# Client rows carry the server name (from the client folder) the way the real
+# sro.sh --list-json now does, and one client is marked hidden to show the
+# "(hidden)" marker the GUI adds.
 PROCESSES = [
-    {"ref": "a", "label": "phBot Manager (MaxiGuard / GE-Proton)", "kind": "job", "depth": 0, "has_children": True, "pid": "41210"},
-    {"ref": "b", "label": "phBot.exe", "kind": "ext", "depth": 1, "has_children": True, "pid": "41388"},
-    {"ref": "c", "label": "sro_client.exe", "kind": "ext", "depth": 2, "has_children": False, "pid": "41502"},
-    {"ref": "d", "label": "phBot.exe", "kind": "ext", "depth": 1, "has_children": True, "pid": "41611"},
-    {"ref": "e", "label": "sro_client.exe", "kind": "ext", "depth": 2, "has_children": False, "pid": "41730"},
-    {"ref": "f", "label": "MaxiGuard: Eternal Online (launcher)", "kind": "job", "depth": 0, "has_children": False, "pid": "43011"},
+    {"ref": "a", "label": "phBot Manager (MaxiGuard / GE-Proton)", "kind": "job", "depth": 0, "has_children": True, "pid": "41210", "hidden": False},
+    {"ref": "b", "label": "phBot.exe", "kind": "ext", "depth": 1, "has_children": True, "pid": "41388", "hidden": False},
+    {"ref": "c", "label": "Athens 80 Cap   sro_client.exe · pid 41502", "kind": "ext", "depth": 2, "has_children": False, "pid": "41502", "hidden": False},
+    {"ref": "d", "label": "phBot.exe", "kind": "ext", "depth": 1, "has_children": True, "pid": "41611", "hidden": False},
+    {"ref": "e", "label": "Eternal Online   sro_client.exe · pid 41730", "kind": "ext", "depth": 2, "has_children": False, "pid": "41730", "hidden": True},
+    {"ref": "f", "label": "MaxiGuard: Eternal Online (launcher)", "kind": "job", "depth": 0, "has_children": False, "pid": "43011", "hidden": False},
 ]
 ALL = dict(distro="apt", deps=True, wine=True, wine_version="wine-11.15", umu=True, runtime32=True,
            ge_proton=True, maxiguard_prefix=True, maxiguard=True, vsroplus=True, phbot=True,
@@ -92,11 +95,21 @@ main.system_summary = lambda: "Ubuntu 24.04 LTS · x86_64"
 main.shortcut_dirs = lambda: {"desktop": TMP / "Desktop", "menu": TMP / "applications"}
 main.SetupTab.refresh_status = lambda self: None
 main.ManageTab._list_json = lambda self: list(PROCESSES)
-try:
-    VERSION = subprocess.run(["git", "-C", str(ROOT), "describe", "--tags", "--abbrev=0"],
-                             capture_output=True, text=True).stdout.strip() or "v1.0.0"
-except OSError:
-    VERSION = "v1.0.0"
+
+# Demo values for the Redirect feature: pretend every client's Media.pk2 is
+# readable (so the Redirect button is enabled), with one client (Athens) set to
+# redirect through a local proxy so its button shows the active state.
+DEMO_CLIENT_INFO = {"locale": 22, "gateport": 15884,
+                    "gateways": ["gw1.example-sro.com"], "division": "DIV01"}
+REDIR_ON = GAMES + "/Athens 80 Cap"
+main.client_info = lambda folder: dict(DEMO_CLIENT_INFO)
+main.get_redirect = lambda folder: ((True, "127.0.0.1", "15884", "") if str(folder) == REDIR_ON
+                                    else (False, "", "", ""))
+# Window state for the Manage screen's hide/show button + "(hidden)" marker:
+# one client (ref "e") is hidden, everything else is shown.
+main.ManageTab._window_state = lambda self, ref: "hidden" if ref == "e" else "shown"
+
+VERSION = "v1.1.0"
 main.app_version = lambda: VERSION
 
 app = QApplication(["sro-gui"])
@@ -288,6 +301,15 @@ dlg.show()
 settle()
 save(dlg.grab().toImage(), "password-dialog")
 dlg.close()
+
+# The Redirect form (per client), pre-filled from the client's Media.pk2 and
+# set to redirect through a local proxy.
+rdlg = main.widgets.RedirectDialog(None, "Athens 80 Cap", dict(DEMO_CLIENT_INFO),
+                                   (True, "127.0.0.1", "15884", ""))
+rdlg.show()
+settle()
+save(rdlg.grab().toImage(), "launch-redirect")
+rdlg.close()
 
 
 # ------------------------------------------------------- terminal menu shot

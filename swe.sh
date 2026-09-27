@@ -362,7 +362,7 @@ act_games() {   # scan a GameFolder and set up every client found
     done < <(scan_games "$dir")
     [ "$found" = 1 ] || warn "No known client folders found under '$dir'."
 }
-finish_launcher() { write_universal_launcher; say "Launcher ready: $SRO_HOME/sro.sh"; }
+finish_launcher() { install_window_tools; write_universal_launcher; say "Launcher ready: $SRO_HOME/sro.sh"; }
 act_toggle_wined3d() {   # some hosts (VMs without GPU passthrough) have no working
                          # Vulkan driver at all, so DXVK fails and the client aborts
                          # right after boot. This forces WineD3D (OpenGL/llvmpipe)

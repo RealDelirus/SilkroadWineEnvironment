@@ -249,6 +249,29 @@ _stash_launcher_assets() {
     # ensure_vcredist functions only ever notices a change if this copy is
     # actually kept in sync with the one setup installs.
     local redist; redist="$(vcredist_exe)" && cp -f "$redist" "$dst/VC_redist.x86.exe" 2>/dev/null || true
+
+    # The client connection-info reader (locale + gateway host/port from
+    # Media.pk2) that sro.sh uses for the correct start locale and for the
+    # Redirect feature. Pure python3, no third-party modules.
+    cp -f "$PKG/lib/sro-clientinfo.py" "$dst/sro-clientinfo.py" 2>/dev/null || true
+
+    # The connection-redirect preload (sroredirect.so) - the Linux-native
+    # counterpart of edxSilkroadLoader5's Redirect_Gateway. Built for BOTH
+    # arches when the toolchain allows it (the wine process is 64-bit under new
+    # WoW64 wine-sro, but 32-bit under GE-Proton), and loaded per-process via
+    # the glibc $LIB token. Native gcc, so it needs no mingw; a missing 32-bit
+    # multilib just means MaxiGuard redirect may not attach (it degrades to a
+    # normal connection). ALWAYS rebuilt so a newer source is picked up.
+    local rdst="$dst/redir"
+    if command -v gcc >/dev/null 2>&1 && [ -f "$PKG/src/sroredirect.c" ]; then
+        mkdir -p "$rdst/lib64"
+        gcc -O2 -fPIC -shared -o "$rdst/lib64/sroredirect.so" "$PKG/src/sroredirect.c" -ldl 2>/dev/null \
+            || rm -f "$rdst/lib64/sroredirect.so"
+        mkdir -p "$rdst/lib"
+        gcc -m32 -O2 -fPIC -shared -o "$rdst/lib/sroredirect.so" "$PKG/src/sroredirect.c" -ldl 2>/dev/null \
+            || rm -f "$rdst/lib/sroredirect.so"
+        rmdir "$rdst/lib" 2>/dev/null || true   # drop the dir if the 32-bit build failed
+    fi
 }
 
 # Writes the interactive universal launcher sro.sh:

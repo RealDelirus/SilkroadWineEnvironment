@@ -538,10 +538,47 @@ install_deps() {
    gcc/g++ make flex bison, mingw-w64 (i686+x86_64), python3 curl git xz,
    plus -dev packages for: freetype fontconfig gnutls, X11 (x11/xext/xcursor/
    xi/xrandr/xrender/xfixes/xcomposite/xinerama), OpenGL (GL/GLU), vulkan,
-   pulseaudio alsa sdl2. Then re-run with --skip-deps."
+   pulseaudio alsa sdl2. Optional: 32-bit gcc/multilib (gcc-multilib /
+   lib32-glibc) for MaxiGuard connection redirect. Then re-run with --skip-deps."
         ;;
     esac
+
+    # Optional 32-bit build toolchain, strictly best-effort (trailing `|| true`
+    # so a missing/misnamed package or a disabled [multilib] repo can NEVER fail
+    # setup): only used to build the 32-bit sroredirect.so for MaxiGuard
+    # connection redirect (Proton runs those clients in a 32-bit process).
+    # Native/vSroPlus redirect is 64-bit and never needs this; if the 32-bit
+    # build is unavailable, MaxiGuard redirect just doesn't attach. Kept OUT of
+    # the mandatory lists above on purpose - putting e.g. lib32-glibc there would
+    # abort the whole install on an Arch box whose [multilib] repo is disabled.
+    case "$pm" in
+      apt)    _sudo apt-get install -y --no-install-recommends gcc-multilib || true ;;
+      pacman) _sudo pacman -S --needed --noconfirm lib32-glibc lib32-gcc-libs || true ;;
+      dnf)    _sudo dnf install -y glibc-devel.i686 libgcc.i686 || true ;;
+      zypper) _sudo zypper --non-interactive install gcc-32bit glibc-devel-32bit || true ;;
+    esac
+
     say "Build dependencies ok."
+}
+
+# xdotool + xprop power the Manage screen's hide/show-window and the
+# server-name-in-title features. Presence-guarded and best-effort: if both are
+# already present (common on desktops - and the case on the dev box) it does
+# nothing and never asks for a password; if they are missing it tries to
+# install them but a failure is harmless (the window features just stay greyed
+# out). Called from finish_launcher (swe.sh) so EVERY setup run picks them up -
+# a fresh install and an existing environment being extended alike - not only
+# first-time installs where install_deps happens to run.
+install_window_tools() {
+    command -v xdotool >/dev/null 2>&1 && command -v xprop >/dev/null 2>&1 && return 0
+    step "Installing optional window tools (xdotool, xprop) for the Manage screen"
+    case "$(detect_pm)" in
+      apt)    _sudo apt-get install -y --no-install-recommends xdotool x11-utils || true ;;
+      pacman) _sudo pacman -S --needed --noconfirm xdotool xorg-xprop || true ;;
+      dnf)    _sudo dnf install -y xdotool xorg-x11-utils || true ;;
+      zypper) _sudo zypper --non-interactive install xdotool xprop || true ;;
+      *)      warn "Install 'xdotool' and 'xprop' to use the Manage screen's hide/show-window feature." ;;
+    esac
 }
 
 # ------------------------------------------------------ 32-bit host runtime

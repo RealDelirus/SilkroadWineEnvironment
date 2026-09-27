@@ -115,9 +115,11 @@ lib/common.sh              distro, package and path helpers
 lib/build-wine-sro.sh      builds the private Wine tree
 lib/setup-prefix.sh        Wine prefixes and per-client setup
 lib/phbot-fetch.py         downloads phBot (+ Manager, plugins, navmesh, minimap) from ProjectHax's CDN
-lib/sro-launcher.sh        control panel, installed as sro.sh (+ headless --start-*/--list-json flags)
+lib/sro-clientinfo.py      reads a client's locale + gateway host/port from its Media.pk2 (pure python)
+lib/sro-launcher.sh        control panel, installed as sro.sh (+ headless --start-*/--list-json/redirect flags)
 patches/                   source-level Wine patches
-src/, prebuilt/            small native shims and bundled fallback assets
+src/                       small native shims (wudfshim, winecheck, sroredirect connection redirect)
+prebuilt/                  bundled fallback assets
 gui/                       the GUI that gets packaged into the AppImage
 build-appimage.sh          builds the AppImage
 tests/smoke-appimage.sh    starts the AppImage on every target distro

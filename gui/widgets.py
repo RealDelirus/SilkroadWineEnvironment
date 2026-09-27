@@ -14,11 +14,11 @@ needs an unpolish/polish round - see repolish().
 from __future__ import annotations
 
 from PySide6.QtCore import Qt, QTimer, QSize
-from PySide6.QtGui import QFontMetrics, QTransform
+from PySide6.QtGui import QFontMetrics, QTransform, QIntValidator
 from PySide6.QtWidgets import (
     QFrame, QWidget, QLabel, QVBoxLayout, QHBoxLayout, QPushButton,
     QProgressBar, QSizePolicy, QApplication, QDialog, QPlainTextEdit, QCheckBox,
-    QButtonGroup, QGridLayout,
+    QButtonGroup, QGridLayout, QLineEdit, QFormLayout,
 )
 
 import theme
@@ -1135,3 +1135,122 @@ class TextTabsDialog(QDialog):
         close.clicked.connect(self.accept)
         row.addWidget(close)
         lay.addLayout(row)
+
+
+class RedirectDialog(QDialog):
+    """Per-client connection redirect - the Linux-native counterpart of
+    edxSilkroadLoader5's Redirect_Gateway form.
+
+    The client's gateway connection (read from its Media.pk2) is sent to a
+    local bot proxy (phBot, RBC, ...) instead of the game server, and the
+    client is started in its real content locale. Purely presentation: the
+    caller passes the detected info + the currently saved settings, and after
+    exec() reads accepted / values().
+
+    `info` keys (from sro.sh --client-info): "locale", "gateport",
+    "division" (str), "gateways" (list[str]). `current`: (enabled, proxy_ip,
+    proxy_port, locale) as saved, any field may be empty.
+    """
+
+    def __init__(self, parent, name: str, info: dict, current):
+        super().__init__(parent)
+        enabled, cur_ip, cur_port, cur_locale = current
+        self.setWindowTitle("Redirect - %s" % name)
+        self.setMinimumWidth(460)
+        lay = QVBoxLayout(self)
+        lay.setContentsMargins(20, 18, 20, 16)
+        lay.setSpacing(12)
+
+        head = QLabel("Redirect client connection")
+        head.setFont(theme.ui_font(13, bold=True))
+        lay.addWidget(head)
+        intro = QLabel(
+            "Send this client's gateway connection to a local bot proxy "
+            "(phBot, RBC, …) instead of the game server. The client is started "
+            "in its own content locale, read from Media.pk2.")
+        intro.setWordWrap(True)
+        intro.setProperty("role", "muted")
+        lay.addWidget(intro)
+
+        # -- what the client itself uses (read-only context) --------------
+        gateways = info.get("gateways") or []
+        detected = QFrame()
+        detected.setObjectName("card")
+        dl = QFormLayout(detected)
+        dl.setContentsMargins(14, 10, 14, 10)
+        dl.setSpacing(6)
+
+        def _muted(text):
+            l = QLabel(text)
+            l.setProperty("role", "dim")
+            l.setFont(theme.ui_font(9))
+            return l
+
+        dl.addRow(_muted("Division"), _muted(info.get("division") or "-"))
+        dl.addRow(_muted("Gateway"),
+                  _muted(", ".join(gateways) if gateways else "-"))
+        dl.addRow(_muted("Gateway port"), _muted(str(info.get("gateport") or "-")))
+        lay.addWidget(detected)
+
+        self.enable = QCheckBox("Enable redirect for this client")
+        self.enable.setChecked(enabled)
+        self.enable.setCursor(Qt.PointingHandCursor)
+        lay.addWidget(self.enable)
+
+        form = QFormLayout()
+        form.setSpacing(8)
+        self.ip = QLineEdit(cur_ip or "127.0.0.1")
+        self.ip.setPlaceholderText("127.0.0.1")
+        self.port = QLineEdit(cur_port or str(info.get("gateport") or ""))
+        self.port.setPlaceholderText(str(info.get("gateport") or "15779"))
+        self.port.setValidator(QIntValidator(1, 65535, self))
+        self.locale = QLineEdit(cur_locale or str(info.get("locale") or ""))
+        self.locale.setPlaceholderText(str(info.get("locale") or "22"))
+        self.locale.setValidator(QIntValidator(0, 999, self))
+        self.locale.setToolTip(
+            "The /NN the client is started with (sro_client.exe 0 /NN 0 0).\n"
+            "Pre-filled from Media.pk2 - leave as detected unless you know better.")
+        form.addRow("Proxy IP", self.ip)
+        form.addRow("Proxy port", self.port)
+        form.addRow("Locale", self.locale)
+        lay.addLayout(form)
+
+        # Enable/disable the inputs with the checkbox, so a disabled redirect
+        # visibly greys its fields (they are still kept/saved).
+        for w in (self.ip, self.port):
+            self.enable.toggled.connect(w.setEnabled)
+            w.setEnabled(enabled)
+
+        row = QHBoxLayout()
+        row.addStretch(1)
+        cancel = QPushButton("Cancel")
+        cancel.setProperty("variant", "ghost")
+        cancel.clicked.connect(self.reject)
+        save = QPushButton("Save")
+        save.setProperty("variant", "primary")
+        save.setDefault(True)
+        save.clicked.connect(self._save)
+        row.addWidget(cancel)
+        row.addWidget(save)
+        lay.addLayout(row)
+        self.accepted_choice = False
+
+    def _save(self):
+        if self.enable.isChecked():
+            if not self.ip.text().strip():
+                self.ip.setFocus(); return
+            if not self.port.text().strip():
+                self.port.setFocus(); return
+        self.accepted_choice = True
+        self.accept()
+
+    def values(self):
+        """(enabled, proxy_ip, proxy_port, locale) - strings, ready for
+        sro.sh --set-redirect. locale is "" when left at the detected value's
+        placeholder (empty field) so the launcher keeps auto-detecting."""
+        return (
+            "1" if self.enable.isChecked() else "0",
+            self.ip.text().strip(),
+            self.port.text().strip(),
+            self.locale.text().strip(),
+        )
