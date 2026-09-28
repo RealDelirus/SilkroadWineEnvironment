@@ -35,6 +35,7 @@ CLIENTS="$SRO_HOME/clients.tsv"     # lines: mode<TAB>label<TAB>folder
 RUNDIR="$SRO_HOME/run"              # one <id>.pid / <id>.info / <id>.log per instance
 REDIRECTS="$SRO_HOME/redirects.tsv" # lines: folder<TAB>enabled<TAB>gw_ip<TAB>gw_port<TAB>locale
 CLIENTINFO="$ASSETS/sro-clientinfo.py"   # reads locale/gateway/port from Media.pk2
+CLIENTPATCH="$ASSETS/sro-clientpatch.py" # neutralises the "execute Silkroad.exe" launcher check
 REDIR_LIB_DIR="$ASSETS/redir"       # sroredirect.so ($LIB/ for the matching arch)
 
 # Some hosts (VMs without GPU passthrough, e.g. plain QEMU/bochs-drm) have no
@@ -303,6 +304,63 @@ client_locale() {   # $1 = client folder
     [ -n "$ov" ] && { printf '%s' "$ov"; return 0; }
     loc="$(_client_info_value "$folder" locale)"
     printf '%s' "${loc:-22}"
+}
+
+# ============================================================ launcher check
+# Some clients (Cyron is one) keep the original launcher HANDSHAKE and refuse to
+# start on their own with a modal ERROR: Please Execute the "Silkroad.exe." -
+# their own Silkroad.exe normally satisfies it (named mutexes + a window handle
+# it passes the client), and edxSilkroadLoader5 works because its loader stands
+# in for that launcher. We start the client directly, so instead we neutralise
+# the one branch that guards that message (sro-clientpatch.py) - the same thing
+# the EDX DLL does in memory, but on a COPY of the exe so the game files are
+# never touched: the patched copy lives in a per-client shadow folder that
+# mirrors the real one through symlinks, and the client is started from there.
+# For clients without the check (or whose check already passes, like most) the
+# patch is a harmless no-op, and if anything about it fails the client just
+# starts from its real folder as before.
+#
+# Prints the directory the client should be started FROM (its real folder, or
+# the shadow folder when a patch was applied). The shadow folder is keyed by the
+# real path, so a client's own files/writes stay consistent across launches, and
+# the symlink mirror is refreshed every time in case the client was updated.
+_client_run_dir() {   # $1=client folder  $2=client exe basename
+    local folder="$1" exe="$2"
+    local src="$folder/$exe"
+    [ -f "$src" ] || { printf '%s' "$folder"; return 0; }
+    # never patch the official launcher (Silkroad.exe) - it IS the launcher.
+    case "$exe" in [Ss]ilkroad.exe) printf '%s' "$folder"; return 0 ;; esac
+    { command -v python3 >/dev/null 2>&1 && [ -f "$CLIENTPATCH" ]; } \
+        || { printf '%s' "$folder"; return 0; }
+    python3 "$CLIENTPATCH" --check "$src" >/dev/null 2>&1 \
+        || { printf '%s' "$folder"; return 0; }   # no launcher check present
+    local key sh sig e bn
+    key="$(printf '%s' "$folder" | sha1sum 2>/dev/null | cut -c1-16)"
+    [ -n "$key" ] || { printf '%s' "$folder"; return 0; }
+    sh="$SRO_HOME/clientpatch/$key"
+    mkdir -p "$sh" 2>/dev/null || { printf '%s' "$folder"; return 0; }
+    # Refresh the symlink mirror (drop old links, relink every real entry except
+    # the client exe, which is the patched copy). Directory symlinks mean the
+    # client's writes into Screenshot/, config files, ... pass through to the
+    # real folder; only brand-new root-level files land in the shadow folder.
+    find "$sh" -maxdepth 1 -mindepth 1 -type l -delete 2>/dev/null || true
+    while IFS= read -r e; do
+        bn="$(basename "$e")"
+        [ "$bn" = "$exe" ] && continue
+        ln -sfn "$e" "$sh/$bn" 2>/dev/null || true
+    done < <(find "$folder" -maxdepth 1 -mindepth 1 2>/dev/null)
+    # (Re)build the patched exe only when the source client changed.
+    sig="$(stat -c '%s:%Y' "$src" 2>/dev/null)"
+    if [ ! -f "$sh/$exe" ] || [ "$(cat "$sh/.srcsig" 2>/dev/null)" != "$sig" ]; then
+        if python3 "$CLIENTPATCH" "$src" "$sh/$exe.tmp" >/dev/null 2>&1; then
+            mv -f "$sh/$exe.tmp" "$sh/$exe" 2>/dev/null \
+                && printf '%s' "$sig" > "$sh/.srcsig" 2>/dev/null
+        else
+            rm -f "$sh/$exe.tmp" 2>/dev/null
+            printf '%s' "$folder"; return 0
+        fi
+    fi
+    [ -f "$sh/$exe" ] && printf '%s' "$sh" || printf '%s' "$folder"
 }
 
 # ============================================================ redirects
@@ -1189,7 +1247,11 @@ start_silkroad_headless() {   # $1=mode $2=folder $3=label ; rest = exe [args...
             ' _ "$pfx" "$WSRO_LOADER" "$WSRO_SERVER"
         fi
         _redirect_env "$folder" 64
-        launch_bg "$label" "$folder" \
+        # Start from the client's real folder, or a shadow folder with the
+        # launcher check patched out when the client needs it (see
+        # _client_run_dir). $1 is the client exe basename; args stay unchanged.
+        local runcwd; runcwd="$(_client_run_dir "$folder" "$1")"
+        launch_bg "$label" "$runcwd" \
             env WINEPREFIX="$pfx" WINELOADER="$WSRO_LOADER" WINESERVER="$WSRO_SERVER" \
                 WINEARCH=win64 WINEDEBUG=-all "${REDIR_ENV[@]}" "$WSRO_LOADER" "$@"
     fi

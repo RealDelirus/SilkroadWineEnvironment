@@ -261,6 +261,15 @@ entry from the list. The client's files are not touched.
   client's own **content locale**, which the app reads from the client's
   `Media.pk2` (for example `sro_client.exe 0 /65 0 0` for a locale-65 client) -
   so you no longer have to care that older versions always used `/22`.
+
+  Some clients (Cyron is one) still insist on being started by their own
+  `Silkroad.exe` and otherwise stop with a *"Please Execute the Silkroad.exe."*
+  box - the same gate edxSilkroadLoader5 gets past because its loader stands in
+  for that launcher. The app now handles this for you: it starts such a client
+  from a patched copy that has this one check removed. Your game files are
+  never modified (the copy lives in a shadow folder of links next to the app's
+  data), the client otherwise runs exactly as before, and clients that don't
+  need it are left untouched.
 - **Launcher** starts the client's own launcher (`Silkroad.exe`), e.g. to patch
   the client or log in through it. It only appears if the folder has one.
 

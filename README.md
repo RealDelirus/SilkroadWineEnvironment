@@ -116,6 +116,7 @@ lib/build-wine-sro.sh      builds the private Wine tree
 lib/setup-prefix.sh        Wine prefixes and per-client setup
 lib/phbot-fetch.py         downloads phBot (+ Manager, plugins, navmesh, minimap) from ProjectHax's CDN
 lib/sro-clientinfo.py      reads a client's locale + gateway host/port from its Media.pk2 (pure python)
+lib/sro-clientpatch.py     removes the "execute Silkroad.exe" launcher check on clients that enforce it (pure python)
 lib/sro-launcher.sh        control panel, installed as sro.sh (+ headless --start-*/--list-json/redirect flags)
 patches/                   source-level Wine patches
 src/                       small native shims (wudfshim, winecheck, sroredirect connection redirect)

@@ -255,6 +255,13 @@ _stash_launcher_assets() {
     # Redirect feature. Pure python3, no third-party modules.
     cp -f "$PKG/lib/sro-clientinfo.py" "$dst/sro-clientinfo.py" 2>/dev/null || true
 
+    # The launcher-check patcher: neutralises the "Please Execute the
+    # Silkroad.exe" gate that some clients (e.g. Cyron) still enforce, so a
+    # client started directly (not via its Silkroad.exe launcher) runs anyway -
+    # the missing piece next to Redirect. Used by sro.sh at client start, on a
+    # copy of the exe (never the original). Pure python3, no third-party modules.
+    cp -f "$PKG/lib/sro-clientpatch.py" "$dst/sro-clientpatch.py" 2>/dev/null || true
+
     # The connection-redirect preload (sroredirect.so) - the Linux-native
     # counterpart of edxSilkroadLoader5's Redirect_Gateway. Built for BOTH
     # arches when the toolchain allows it (the wine process is 64-bit under new
