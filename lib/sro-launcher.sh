@@ -400,21 +400,60 @@ except OSError:
 PY
     fi
 }
-# Builds the LD_PRELOAD env for a redirect-enabled client and leaves it in the
-# REDIR_ENV array (empty when redirect is off or unusable). Rule set: each
-# resolved gateway IP on the client's gateway port -> the proxy; if no gateway
-# IP could be resolved, fall back to matching the gateway port on any address
-# (still scoped to this one client process, so it only ever affects its own
-# server connection). The preload path uses the glibc $LIB token so the right
-# 32-/64-bit build is picked per process; $2 lets the MaxiGuard path point at a
-# copy inside the (container-visible) prefix instead of $ASSETS.
+# Builds the LD_PRELOAD env for a client launch and leaves it in the REDIR_ENV
+# array (empty only when the preload is not built). Rule set: each resolved
+# gateway IP on the client's gateway port -> the proxy; if no gateway IP could
+# be resolved, fall back to matching the gateway port on any address (still
+# scoped to this one client, so it only ever affects its own server
+# connection).
+#
+# The preload is set for every native (plain/vSroPlus) client, with an empty
+# SROREDIR_RULES when its redirect is off: under Wine 11 / Proton the actual connect() is done by the
+# prefix's ONE shared wineserver, which inherits LD_PRELOAD only from the
+# client that happened to start it. sroredirect.so inside the wineserver looks
+# up the rules of whichever client sent each connect request (from that
+# process's own environment), so several clients in one prefix can each have
+# their own redirect - as long as the wineserver was started with the preload.
+# $2 picks the build for the client process (explicit paths - the glibc $LIB
+# token does not map to lib64/lib on every distro); the wineserver is always
+# 64-bit, so a 32-bit client (GE-Proton/MaxiGuard) gets BOTH builds - the
+# dynamic loader skips the one of the wrong ELF class. $3 lets the MaxiGuard path point
+# at a copy inside the (container-visible) prefix instead of $ASSETS.
 REDIR_ENV=()
 REDIR_NOTE=""
-_redirect_env() {   # $1=folder  $2=arch(64|32)  [$3=preload dir override]
+_redirect_env() {   # $1=folder  $2=arch(64|32)  [$3=preload dir override]  [$4=prefix]
     REDIR_ENV=(); REDIR_NOTE=""
-    redirect_enabled "$1" || return 0
-    local arch="${2:-64}"
-    local proxy_ip proxy_port gate_port rules="" ip host
+    local arch="${2:-64}" dir="${3:-$REDIR_LIB_DIR}" pfx="${4:-}"
+    local rules="" preload=""
+    if [ "$arch" = 32 ]; then
+        [ -f "$dir/lib/sroredirect.so" ] && preload="$dir/lib/sroredirect.so"
+        [ -f "$dir/lib64/sroredirect.so" ] && preload="${preload:+$preload }$dir/lib64/sroredirect.so"
+    else
+        [ -f "$dir/lib64/sroredirect.so" ] && preload="$dir/lib64/sroredirect.so"
+    fi
+    if redirect_enabled "$1"; then
+        _redirect_rules "$1"
+        rules="$REDIR_RULES"
+        if [ -n "$rules" ] && [ -z "$preload" ]; then
+            REDIR_NOTE="redirect: sroredirect.so (${arch}-bit) not built - ignored (install gcc, and 32-bit multilib for MaxiGuard)"
+        elif [ -n "$rules" ] && [ -n "$pfx" ] && ! _wineserver_has_preload "$pfx"; then
+            REDIR_NOTE="redirect: the Wine session of this client type was started without redirect support - close ALL running clients of this type and start again"
+        fi
+    fi
+    [ -n "$preload" ] || return 0
+    # MaxiGuard (32-bit, inside Proton's container) only gets the preload when
+    # its own redirect is on - kept as before so a MaxiGuard client without
+    # redirect runs exactly as it always did.
+    [ "$arch" = 32 ] && [ -z "$rules" ] && return 0
+    # LD_PRELOAD is appended (not overwritten) in case Proton/umu set their own.
+    REDIR_ENV=(LD_PRELOAD="${preload}${LD_PRELOAD:+ $LD_PRELOAD}" SROREDIR_RULES="$rules")
+}
+# Rules for a redirect-enabled client -> REDIR_RULES (empty + REDIR_NOTE when
+# the saved redirect is incomplete or the gateway port is unknown).
+REDIR_RULES=""
+_redirect_rules() {   # $1=folder
+    REDIR_RULES=""
+    local proxy_ip proxy_port gate_port ip host
     proxy_ip="$(_redirect_field "$1" 3)"; proxy_port="$(_redirect_field "$1" 4)"
     [ -n "$proxy_ip" ] && [ -n "$proxy_port" ] || { REDIR_NOTE="redirect enabled but no proxy set - ignored"; return 0; }
     gate_port="$(_client_info_value "$1" gateport)"
@@ -430,29 +469,23 @@ _redirect_env() {   # $1=folder  $2=arch(64|32)  [$3=preload dir override]
         while IFS= read -r ip || [ -n "$ip" ]; do [ -n "$ip" ] && ips+=("$ip"); done < <(_resolve_ipv4 "$host")
     done < <(client_info "$1" | sed -n 's/^gateway=//p')
     if [ "${#ips[@]}" -gt 0 ]; then
-        for ip in "${ips[@]}"; do rules+="${ip},${gate_port}=${proxy_ip},${proxy_port};"; done
+        for ip in "${ips[@]}"; do REDIR_RULES+="${ip},${gate_port}=${proxy_ip},${proxy_port};"; done
     else
-        rules="*,${gate_port}=${proxy_ip},${proxy_port};"
+        REDIR_RULES="*,${gate_port}=${proxy_ip},${proxy_port};"
         REDIR_NOTE="redirect: gateway host did not resolve - matching gateway port on any address"
     fi
-    # Pick the build matching the arch of the process that will call connect():
-    # the native wine-sro loader is a 64-bit process (new WoW64 runs the 32-bit
-    # PE inside it), while GE-Proton runs a 32-bit client in a real 32-bit
-    # process. The glibc $LIB token is not portable enough for this (on Arch it
-    # does not map to lib64/lib the way it does on Debian), so choose the path
-    # explicitly. Fall back to the other arch if only one was built.
-    # No cross-arch fallback: a wrong-arch .so can never load into the process
-    # (the loader would only print an ELFCLASS error into the log), so if the
-    # matching build is missing, redirect is simply unavailable for this client.
-    local dir="${3:-$REDIR_LIB_DIR}" preload
-    if [ "$arch" = 32 ]; then preload="$dir/lib/sroredirect.so"
-    else preload="$dir/lib64/sroredirect.so"; fi
-    if [ ! -f "$preload" ]; then
-        REDIR_NOTE="redirect: sroredirect.so (${arch}-bit) not built - ignored (install 32-bit gcc/multilib for MaxiGuard)"
-        return 0
-    fi
-    # LD_PRELOAD is appended (not overwritten) in case Proton/umu set their own.
-    REDIR_ENV=(LD_PRELOAD="${preload}${LD_PRELOAD:+ $LD_PRELOAD}" SROREDIR_RULES="$rules")
+}
+# True unless a wineserver is already running for prefix $1 WITHOUT the
+# redirect preload (e.g. started by an older version or a tool run in that
+# prefix) - a new client joins that session and its redirect cannot attach.
+_wineserver_has_preload() {   # $1 = prefix
+    local p env
+    for p in $(pgrep -x wineserver 2>/dev/null); do
+        env="$(tr '\0' '\n' < "/proc/$p/environ" 2>/dev/null)" || continue
+        printf '%s\n' "$env" | grep -qxF "WINEPREFIX=$1" || continue
+        printf '%s\n' "$env" | grep -q '^LD_PRELOAD=.*sroredirect\.so' || return 1
+    done
+    return 0
 }
 
 # ============================================================ file browser
@@ -781,8 +814,11 @@ launch_bg() {   # $1=label $2=folder(or empty) ; rest = cmd args...
     local label="$1" folder="$2"; shift 2
     mkdir -p "$RUNDIR"
     local id; id="$(date +%s%N)"; local log="$RUNDIR/$id.log"
+    # Append mode, so lines other writers add to the same log (the redirect
+    # note below, sroredirect.so in the shared wineserver) are never
+    # overwritten by the client's own output.
     setsid bash -c 'd="$1"; shift; [ -n "$d" ] && cd "$d" 2>/dev/null; exec "$@"' \
-        _ "$folder" "$@" >"$log" 2>&1 </dev/null &
+        _ "$folder" "$@" >>"$log" 2>&1 </dev/null &
     local pid=$!
     disown 2>/dev/null || true
     echo "$pid" > "$RUNDIR/$id.pid"
@@ -1226,7 +1262,7 @@ start_silkroad_headless() {   # $1=mode $2=folder $3=label ; rest = exe [args...
         # not survive into the container the client just connects normally - the
         # activation line the preload logs is how you can confirm it took.
         mg_ensure_redirect_lib "$pfx"
-        _redirect_env "$folder" 32 "$pfx/drive_c/sroredirect"
+        _redirect_env "$folder" 32 "$pfx/drive_c/sroredirect" "$pfx"
         # Launch via umu-run (GE-Proton + Steam Linux Runtime): the ONLY combo that
         # both passes MaxiGuard's VM check AND survives world entry. Running GE Wine
         # directly passes the VM check but crashes when the client resets the device
@@ -1246,7 +1282,7 @@ start_silkroad_headless() {   # $1=mode $2=folder $3=label ; rest = exe [args...
                 WINEPREFIX="$1" "$3" -w 2>/dev/null
             ' _ "$pfx" "$WSRO_LOADER" "$WSRO_SERVER"
         fi
-        _redirect_env "$folder" 64
+        _redirect_env "$folder" 64 "" "$pfx"
         # Start from the client's real folder, or a shadow folder with the
         # launcher check patched out when the client needs it (see
         # _client_run_dir). $1 is the client exe basename; args stay unchanged.
@@ -1255,6 +1291,8 @@ start_silkroad_headless() {   # $1=mode $2=folder $3=label ; rest = exe [args...
             env WINEPREFIX="$pfx" WINELOADER="$WSRO_LOADER" WINESERVER="$WSRO_SERVER" \
                 WINEARCH=win64 WINEDEBUG=-all "${REDIR_ENV[@]}" "$WSRO_LOADER" "$@"
     fi
+    # Why a redirect could not attach, into the client's own log.
+    [ -n "$REDIR_NOTE" ] && [ -n "${LAST_LOG:-}" ] && printf '[sro.sh] %s\n' "$REDIR_NOTE" >> "$LAST_LOG"
     # Put the server name (the client folder's name) on the client's window
     # title, once its window shows up - so multiple running clients are
     # distinguishable. Detached and best-effort (see the client-windows section).

@@ -18,7 +18,8 @@ from PySide6.QtGui import QFontMetrics, QTransform, QIntValidator
 from PySide6.QtWidgets import (
     QFrame, QWidget, QLabel, QVBoxLayout, QHBoxLayout, QPushButton,
     QProgressBar, QSizePolicy, QApplication, QDialog, QPlainTextEdit, QCheckBox,
-    QButtonGroup, QGridLayout, QLineEdit, QFormLayout,
+    QButtonGroup, QGridLayout, QLineEdit, QFormLayout, QComboBox, QTreeWidget,
+    QTreeWidgetItem, QAbstractItemView,
 )
 
 import theme
@@ -1150,11 +1151,17 @@ class RedirectDialog(QDialog):
     `info` keys (from sro.sh --client-info): "locale", "gateport",
     "division" (str), "gateways" (list[str]). `current`: (enabled, proxy_ip,
     proxy_port, locale) as saved, any field may be empty.
+
+    `favorites`: the saved redirect favorites, [(name, ip, port), ...]. One
+    can be picked to fill Proxy IP/port, and the current target saved as a
+    new one; the (possibly extended) list is in .favorites afterwards, for
+    the caller to store - also when the dialog is cancelled.
     """
 
-    def __init__(self, parent, name: str, info: dict, current):
+    def __init__(self, parent, name: str, info: dict, current, favorites=None):
         super().__init__(parent)
         enabled, cur_ip, cur_port, cur_locale = current
+        self.favorites = list(favorites or [])
         self.setWindowTitle("Redirect - %s" % name)
         self.setMinimumWidth(460)
         lay = QVBoxLayout(self)
@@ -1210,14 +1217,34 @@ class RedirectDialog(QDialog):
         self.locale.setToolTip(
             "The /NN the client is started with (sro_client.exe 0 /NN 0 0).\n"
             "Pre-filled from Media.pk2 - leave as detected unless you know better.")
+        # Favorites: pick one to fill IP + port, or keep the current target
+        # as a new favorite. The combo follows manual edits, so it always
+        # shows which favorite (if any) the fields match.
+        self.fav_combo = QComboBox()
+        self.fav_combo.setCursor(Qt.PointingHandCursor)
+        self.fav_save = QPushButton("Save as favorite")
+        self.fav_save.setIcon(theme.icon("star", theme.TEXT, 14))
+        self.fav_save.setCursor(Qt.PointingHandCursor)
+        self.fav_save.setToolTip("Keep this proxy IP + port in the favorites list")
+        self.fav_save.clicked.connect(self._save_favorite)
+        fav_row = QHBoxLayout()
+        fav_row.setSpacing(8)
+        fav_row.addWidget(self.fav_combo, 1)
+        fav_row.addWidget(self.fav_save)
+        self._fill_favorites()
+        self.fav_combo.activated.connect(self._pick_favorite)
+        form.addRow("Favorite", fav_row)
         form.addRow("Proxy IP", self.ip)
         form.addRow("Proxy port", self.port)
         form.addRow("Locale", self.locale)
         lay.addLayout(form)
+        self.ip.textChanged.connect(self._sync_favorite)
+        self.port.textChanged.connect(self._sync_favorite)
+        self._sync_favorite()
 
         # Enable/disable the inputs with the checkbox, so a disabled redirect
         # visibly greys its fields (they are still kept/saved).
-        for w in (self.ip, self.port):
+        for w in (self.ip, self.port, self.fav_combo, self.fav_save):
             self.enable.toggled.connect(w.setEnabled)
             w.setEnabled(enabled)
 
@@ -1234,6 +1261,39 @@ class RedirectDialog(QDialog):
         row.addWidget(save)
         lay.addLayout(row)
         self.accepted_choice = False
+
+    def _fill_favorites(self):
+        self.fav_combo.clear()
+        self.fav_combo.addItem("Custom" if self.favorites else "Custom (no favorites yet)")
+        for fname, fip, fport in self.favorites:
+            self.fav_combo.addItem(theme.icon("star", theme.ACCENT, 14),
+                                   "%s  -  %s:%s" % (fname, fip, fport))
+
+    def _pick_favorite(self, index: int):
+        if index <= 0:
+            return
+        _, fip, fport = self.favorites[index - 1]
+        self.ip.setText(fip)
+        self.port.setText(fport)
+
+    def _sync_favorite(self):
+        target = (self.ip.text().strip(), self.port.text().strip())
+        index = next((i + 1 for i, (_, fip, fport) in enumerate(self.favorites)
+                      if (fip, fport) == target), 0)
+        self.fav_combo.setCurrentIndex(index)
+        self.fav_save.setVisible(index == 0)
+
+    def _save_favorite(self):
+        ip, port = self.ip.text().strip(), self.port.text().strip()
+        if not ip:
+            self.ip.setFocus(); return
+        if not port:
+            self.port.setFocus(); return
+        dlg = FavoriteEditDialog(self, "Save as favorite", ("", ip, port))
+        if dlg.exec():
+            self.favorites.append(dlg.values())
+            self._fill_favorites()
+            self._sync_favorite()
 
     def _save(self):
         if self.enable.isChecked():
@@ -1254,3 +1314,179 @@ class RedirectDialog(QDialog):
             self.port.text().strip(),
             self.locale.text().strip(),
         )
+
+
+class FavoriteEditDialog(QDialog):
+    """Name + proxy IP + port of one redirect favorite. `current` is
+    (name, ip, port); the result is in values() after an accepted exec()."""
+
+    def __init__(self, parent, title: str, current=("", "127.0.0.1", "")):
+        super().__init__(parent)
+        cur_name, cur_ip, cur_port = current
+        self.setWindowTitle(title)
+        self.setMinimumWidth(360)
+        lay = QVBoxLayout(self)
+        lay.setContentsMargins(20, 18, 20, 16)
+        lay.setSpacing(12)
+        form = QFormLayout()
+        form.setSpacing(8)
+        self.name = QLineEdit(cur_name)
+        self.name.setPlaceholderText("e.g. phBot 1")
+        self.ip = QLineEdit(cur_ip or "127.0.0.1")
+        self.ip.setPlaceholderText("127.0.0.1")
+        self.port = QLineEdit(cur_port)
+        self.port.setPlaceholderText("15779")
+        self.port.setValidator(QIntValidator(1, 65535, self))
+        form.addRow("Name", self.name)
+        form.addRow("Proxy IP", self.ip)
+        form.addRow("Proxy port", self.port)
+        lay.addLayout(form)
+        row = QHBoxLayout()
+        row.addStretch(1)
+        cancel = QPushButton("Cancel")
+        cancel.setProperty("variant", "ghost")
+        cancel.clicked.connect(self.reject)
+        save = QPushButton("Save")
+        save.setProperty("variant", "primary")
+        save.setDefault(True)
+        save.clicked.connect(self._save)
+        row.addWidget(cancel)
+        row.addWidget(save)
+        lay.addLayout(row)
+        self.name.setFocus()
+
+    def _save(self):
+        for w in (self.name, self.ip, self.port):
+            if not w.text().strip():
+                w.setFocus(); return
+        self.accept()
+
+    def values(self):
+        """(name, ip, port). Tabs/newlines are dropped - the list is stored
+        as one tab-separated line per favorite."""
+        clean = lambda w: " ".join(w.text().split())
+        return clean(self.name), clean(self.ip), clean(self.port)
+
+
+class RedirectFavoritesDialog(QDialog):
+    """Add / edit / remove / reorder the redirect favorites - the proxy
+    targets offered for one-click selection on every client's Redirect
+    button. Works on a copy; the edited list is in .favorites after an
+    accepted exec()."""
+
+    def __init__(self, parent, favorites):
+        super().__init__(parent)
+        self.favorites = list(favorites)
+        self.setWindowTitle("Redirect favorites")
+        self.setMinimumSize(480, 340)
+        lay = QVBoxLayout(self)
+        lay.setContentsMargins(20, 18, 20, 16)
+        lay.setSpacing(12)
+
+        head = QLabel("Redirect favorites")
+        head.setFont(theme.ui_font(13, bold=True))
+        lay.addWidget(head)
+        intro = QLabel(
+            "Proxy targets you use often (e.g. one per phBot instance). Pick one "
+            "from a client's Redirect button to switch that client to it with "
+            "one click.")
+        intro.setWordWrap(True)
+        intro.setProperty("role", "muted")
+        lay.addWidget(intro)
+
+        body = QHBoxLayout()
+        body.setSpacing(10)
+        self.tree = QTreeWidget()
+        self.tree.setHeaderLabels(["Name", "Proxy IP", "Port"])
+        self.tree.setRootIsDecorated(False)
+        self.tree.setSelectionMode(QAbstractItemView.SingleSelection)
+        self.tree.itemDoubleClicked.connect(lambda *_: self._edit())
+        self.tree.itemSelectionChanged.connect(self._update_buttons)
+        body.addWidget(self.tree, 1)
+
+        side = QVBoxLayout()
+        side.setSpacing(6)
+        self.add_btn = QPushButton("Add")
+        self.add_btn.setIcon(theme.icon("plus", theme.TEXT, 14))
+        self.add_btn.clicked.connect(self._add)
+        self.edit_btn = QPushButton("Edit")
+        self.edit_btn.clicked.connect(self._edit)
+        self.up_btn = QPushButton("Up")
+        self.up_btn.clicked.connect(lambda: self._move(-1))
+        self.down_btn = QPushButton("Down")
+        self.down_btn.clicked.connect(lambda: self._move(1))
+        self.remove_btn = QPushButton("Remove")
+        self.remove_btn.setProperty("variant", "danger")
+        self.remove_btn.setIcon(theme.icon("trash", theme.DANGER, 14))
+        self.remove_btn.clicked.connect(self._remove)
+        for b in (self.add_btn, self.edit_btn, self.up_btn, self.down_btn, self.remove_btn):
+            b.setCursor(Qt.PointingHandCursor)
+            side.addWidget(b)
+        side.addStretch(1)
+        body.addLayout(side)
+        lay.addLayout(body, 1)
+
+        row = QHBoxLayout()
+        row.addStretch(1)
+        cancel = QPushButton("Cancel")
+        cancel.setProperty("variant", "ghost")
+        cancel.clicked.connect(self.reject)
+        save = QPushButton("Save")
+        save.setProperty("variant", "primary")
+        save.setDefault(True)
+        save.clicked.connect(self.accept)
+        row.addWidget(cancel)
+        row.addWidget(save)
+        lay.addLayout(row)
+        self._refresh(0 if self.favorites else -1)
+
+    def _refresh(self, select: int):
+        self.tree.clear()
+        for fav in self.favorites:
+            self.tree.addTopLevelItem(QTreeWidgetItem(list(fav)))
+        for c in range(3):
+            self.tree.resizeColumnToContents(c)
+        if 0 <= select < len(self.favorites):
+            self.tree.setCurrentItem(self.tree.topLevelItem(select))
+        self._update_buttons()
+
+    def _current(self) -> int:
+        item = self.tree.currentItem()
+        return self.tree.indexOfTopLevelItem(item) if item and item.isSelected() else -1
+
+    def _update_buttons(self):
+        i = self._current()
+        for b in (self.edit_btn, self.remove_btn):
+            b.setEnabled(i >= 0)
+        self.up_btn.setEnabled(i > 0)
+        self.down_btn.setEnabled(0 <= i < len(self.favorites) - 1)
+
+    def _add(self):
+        dlg = FavoriteEditDialog(self, "Add favorite")
+        if dlg.exec():
+            self.favorites.append(dlg.values())
+            self._refresh(len(self.favorites) - 1)
+
+    def _edit(self):
+        i = self._current()
+        if i < 0:
+            return
+        dlg = FavoriteEditDialog(self, "Edit favorite", self.favorites[i])
+        if dlg.exec():
+            self.favorites[i] = dlg.values()
+            self._refresh(i)
+
+    def _move(self, step: int):
+        i = self._current()
+        j = i + step
+        if i < 0 or not 0 <= j < len(self.favorites):
+            return
+        self.favorites[i], self.favorites[j] = self.favorites[j], self.favorites[i]
+        self._refresh(j)
+
+    def _remove(self):
+        i = self._current()
+        if i < 0:
+            return
+        del self.favorites[i]
+        self._refresh(min(i, len(self.favorites) - 1))

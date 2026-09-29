@@ -105,6 +105,11 @@ REDIR_ON = GAMES + "/Athens 80 Cap"
 main.client_info = lambda folder: dict(DEMO_CLIENT_INFO)
 main.get_redirect = lambda folder: ((True, "127.0.0.1", "15884", "") if str(folder) == REDIR_ON
                                     else (False, "", "", ""))
+# Redirect favorites; the first one is Athens' active target, so its button
+# shows the favorite's name.
+DEMO_FAVORITES = [("phBot 1", "127.0.0.1", "15884"), ("phBot 2", "127.0.0.1", "15885"),
+                  ("RBC", "127.0.0.1", "16000")]
+main.read_redirect_favorites = lambda: list(DEMO_FAVORITES)
 # Window state for the Manage screen's hide/show button + "(hidden)" marker:
 # one client (ref "e") is hidden, everything else is shown.
 main.ManageTab._window_state = lambda self, ref: "hidden" if ref == "e" else "shown"
@@ -249,6 +254,20 @@ p.drawImage(at, menu.grab().toImage())
 p.end()
 save(base, "launch-context-menu")
 menu.close()
+
+# The Redirect button's favorites menu, under Athens' button.
+rbtn = next(b for b in cpane.findChildren(QPushButton) if b.text() == "phBot 1")
+cpane.redirect_menu(REDIR_ON, "Athens 80 Cap", dict(DEMO_CLIENT_INFO), rbtn)
+menu = captured[-1]
+menu.adjustSize()
+menu.show()
+settle()
+base = w.grab().toImage()
+p = QPainter(base)
+p.drawImage(rbtn.mapTo(w, QPoint(0, rbtn.height())), menu.grab().toImage())
+p.end()
+save(base, "launch-redirect-menu")
+menu.close()
 w.close()
 settle()
 
@@ -305,11 +324,17 @@ dlg.close()
 # The Redirect form (per client), pre-filled from the client's Media.pk2 and
 # set to redirect through a local proxy.
 rdlg = main.widgets.RedirectDialog(None, "Athens 80 Cap", dict(DEMO_CLIENT_INFO),
-                                   (True, "127.0.0.1", "15884", ""))
+                                   (True, "127.0.0.1", "15884", ""), DEMO_FAVORITES)
 rdlg.show()
 settle()
 save(rdlg.grab().toImage(), "launch-redirect")
 rdlg.close()
+
+fdlg = main.widgets.RedirectFavoritesDialog(None, DEMO_FAVORITES)
+fdlg.show()
+settle()
+save(fdlg.grab().toImage(), "redirect-favorites")
+fdlg.close()
 
 
 # ------------------------------------------------------- terminal menu shot

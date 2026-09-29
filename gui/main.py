@@ -98,6 +98,9 @@ SWE = REPO / "swe.sh"
 SRO_HOME = Path(os.environ.get("SRO_HOME", Path.home() / ".local/share/sro-linux"))
 SRO_SH = SRO_HOME / "sro.sh"
 CLIENTS_TSV = SRO_HOME / "clients.tsv"
+# Redirect favorites (proxy targets offered on every client's Redirect button),
+# one per line: name<TAB>proxy_ip<TAB>proxy_port. GUI-only, so kept here.
+REDIRECT_FAVORITES_TSV = SRO_HOME / "redirect-favorites.tsv"
 
 MODES = ["plain", "vsroplus", "maxiguard"]
 MODE_LABEL = {"maxiguard": "MaxiGuard", "vsroplus": "vSroPlus", "plain": "Plain"}
@@ -1620,6 +1623,29 @@ def get_redirect(folder: str):
     return parts[0] == "1", parts[1], parts[2], parts[3]
 
 
+def read_redirect_favorites() -> list[tuple[str, str, str]]:
+    """[(name, proxy_ip, proxy_port), ...] in the saved order."""
+    favs = []
+    try:
+        lines = REDIRECT_FAVORITES_TSV.read_text(encoding="utf-8").splitlines()
+    except OSError:
+        return favs
+    for line in lines:
+        parts = line.split("\t")
+        if len(parts) >= 3 and all(p.strip() for p in parts[:3]):
+            favs.append((parts[0], parts[1], parts[2]))
+    return favs
+
+
+def write_redirect_favorites(favs) -> None:
+    """Replace the saved favorites (temp file + rename, so a crash never
+    leaves a half-written list)."""
+    SRO_HOME.mkdir(parents=True, exist_ok=True)
+    tmp = REDIRECT_FAVORITES_TSV.with_suffix(".tsv.new")
+    tmp.write_text("".join("%s\t%s\t%s\n" % tuple(f) for f in favs), encoding="utf-8")
+    tmp.replace(REDIRECT_FAVORITES_TSV)
+
+
 def available_modes() -> dict:
     """{'plain': True, 'vsroplus': bool, 'maxiguard': bool} - mirrors the TUI's
     pick_mode(), which only ever offers a mode that is actually usable (e.g.
@@ -1837,6 +1863,7 @@ class ClientPane(QWidget):
                 "Add a client folder below."))
             self.clients_layout.addStretch(1)
             return
+        favorites = read_redirect_favorites()
         for m, label, folder in rows:
             card = widgets.ClientCard(label, folder)
             # One button per thing that can be started, instead of a
@@ -1892,16 +1919,22 @@ class ClientPane(QWidget):
                 enabled, rip, rport, rloc = get_redirect(folder)
                 redirect_btn.setIcon(theme.icon(
                     "arrow-right", theme.ACCENT if enabled else theme.TEXT, 14))
+                fav = next((f for f in favorites if (f[1], f[2]) == (rip, rport)), None)
                 if enabled:
-                    redirect_btn.setText("Redirect ✓")
+                    # The active favorite's name on the button, so several
+                    # clients show at a glance which proxy each one uses.
+                    text = fav[0] if fav else "Redirect ✓"
+                    redirect_btn.setText(redirect_btn.fontMetrics().elidedText(
+                        text, Qt.ElideRight, self.START_BTN_WIDTH - 40))
                     redirect_btn.setToolTip(
-                        "Redirecting gateway to %s:%s (locale %s).\nClick to change."
-                        % (rip, rport, rloc or info.get("locale")))
+                        "Redirecting gateway to %s%s:%s (locale %s).\nClick to change."
+                        % ("%s - " % fav[0] if fav else "", rip, rport,
+                           rloc or info.get("locale")))
                 else:
                     redirect_btn.setToolTip("Redirect this client to a local bot proxy")
                 redirect_btn.clicked.connect(
-                    lambda checked=False, f=folder, n=label, i=info:
-                        self.open_redirect(f, n, i))
+                    lambda checked=False, f=folder, n=label, i=info, b=redirect_btn:
+                        self.redirect_menu(f, n, i, b))
             card.add_action(redirect_btn)
 
             remove_btn = QPushButton()
@@ -1961,23 +1994,84 @@ class ClientPane(QWidget):
             QMessageBox.warning(self, "Could not add client", err or "unknown error")
         self.reload_clients()
 
+    def redirect_menu(self, folder: str, name: str, info: dict, button: QPushButton):
+        """Quick switch between the redirect favorites (plus Off / custom /
+        manage) under the Redirect button. Without any favorites yet it goes
+        straight to the full form, as before - favorites are created there."""
+        favorites = read_redirect_favorites()
+        if not favorites:
+            self.open_redirect(folder, name, info)
+            return
+        enabled, rip, rport, rloc = get_redirect(folder)
+        menu = QMenu(self)
+        head = menu.addAction("Redirect - %s" % name)
+        head.setEnabled(False)
+        # The active entry gets a check mark in place of its icon (a
+        # checkable action with an icon shows no check mark of its own).
+        check = theme.icon("check", theme.ACCENT, 14)
+        star = theme.icon("star", theme.TEXT_DIM, 14)
+        off = menu.addAction(check if not enabled else QIcon(), "Off (connect directly)")
+        off.triggered.connect(lambda: self.set_redirect(
+            folder, name, "0", rip, rport, rloc))
+        for fname, fip, fport in favorites:
+            active = enabled and (fip, fport) == (rip, rport)
+            act = menu.addAction(check if active else star, "%s  -  %s:%s" % (fname, fip, fport))
+            act.triggered.connect(
+                lambda checked=False, fn=fname, fi=fip, fp=fport:
+                    self.set_redirect(folder, name, "1", fi, fp, rloc, fn))
+        menu.addSeparator()
+        menu.addAction("Custom / locale…").triggered.connect(
+            lambda: self.open_redirect(folder, name, info))
+        menu.addAction("Manage favorites…").triggered.connect(self.manage_redirect_favorites)
+        menu.exec(button.mapToGlobal(button.rect().bottomLeft()))
+
+    def set_redirect(self, folder: str, name: str, enabled: str, ip: str, port: str,
+                     locale: str, favorite: str = "") -> None:
+        rc, out, err = run_sro_sh(["--set-redirect", folder, enabled, ip, port, locale])
+        if rc == 0:
+            if enabled == "1":
+                self.status_panel.flash("done", "Redirect saved", "%s → %s%s:%s" % (
+                    name, "%s - " % favorite if favorite else "", ip, port))
+            else:
+                self.status_panel.flash("done", "Redirect off", name)
+            self.log.appendPlainText(
+                "Redirect %s for %s: %s:%s locale=%s"
+                % ("on" if enabled == "1" else "off", name, ip, port, locale or "auto"))
+        else:
+            QMessageBox.warning(self, "Could not save redirect", err or "unknown error")
+        self.reload_clients()
+
+    def _store_favorites(self, before, after) -> bool:
+        if list(after) == list(before):
+            return False
+        try:
+            write_redirect_favorites(after)
+        except OSError as e:
+            QMessageBox.warning(self, "Could not save favorites", str(e))
+            return False
+        return True
+
+    def manage_redirect_favorites(self):
+        favorites = read_redirect_favorites()
+        dlg = widgets.RedirectFavoritesDialog(self, favorites)
+        if dlg.exec() and self._store_favorites(favorites, dlg.favorites):
+            self.status_panel.flash("done", "Favorites saved",
+                                    "%d redirect favorite%s" % (
+                                        len(dlg.favorites), "" if len(dlg.favorites) == 1 else "s"))
+            self.reload_clients()
+
     def open_redirect(self, folder: str, name: str, info: dict):
         current = get_redirect(folder)
-        dlg = widgets.RedirectDialog(self, name, info, current)
-        if dlg.exec() and dlg.accepted_choice:
+        favorites = read_redirect_favorites()
+        dlg = widgets.RedirectDialog(self, name, info, current, favorites)
+        accepted = dlg.exec() and dlg.accepted_choice
+        # Favorites saved in the form are kept even if it was cancelled.
+        changed = self._store_favorites(favorites, dlg.favorites)
+        if accepted:
             enabled, ip, port, locale = dlg.values()
-            rc, out, err = run_sro_sh(["--set-redirect", folder, enabled, ip, port, locale])
-            if rc == 0:
-                if enabled == "1":
-                    self.status_panel.flash("done", "Redirect saved",
-                                            "%s → %s:%s" % (name, ip, port))
-                else:
-                    self.status_panel.flash("done", "Redirect off", name)
-                self.log.appendPlainText(
-                    "Redirect %s for %s: %s:%s locale=%s"
-                    % ("on" if enabled == "1" else "off", name, ip, port, locale or "auto"))
-            else:
-                QMessageBox.warning(self, "Could not save redirect", err or "unknown error")
+            fav = next((f[0] for f in dlg.favorites if (f[1], f[2]) == (ip, port)), "")
+            self.set_redirect(folder, name, enabled, ip, port, locale, fav)
+        elif changed:
             self.reload_clients()
 
     def remove_client(self, mode: str, folder: str):

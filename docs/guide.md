@@ -288,6 +288,8 @@ Click **Redirect** to open the form:
 - **Proxy IP** / **Proxy port** is where the connection goes - usually
   `127.0.0.1` and the port your proxy listens on (pre-filled with the client's
   own gateway port).
+- **Favorite** fills Proxy IP and port from one of your saved favorites (see
+  below). **Save as favorite** keeps the target you typed in as a new one.
 - **Locale** is the locale the client starts in. It is read from the client's
   `Media.pk2`; leave it unless you have a reason to change it.
 
@@ -295,11 +297,31 @@ The detected division, gateway host and gateway port are shown at the top so
 you can see what is being redirected. A client whose `Media.pk2` uses a custom
 encryption key can't be read, so its Redirect button is greyed out.
 
-When redirect is on, the button shows a check mark and its tooltip lists the
-target. Redirect works for **Plain** and **vSroPlus** clients; for
+When redirect is on, the button shows the favorite's name (or a check mark
+for a target that is not a favorite) and its tooltip lists the target. Redirect works for **Plain** and **vSroPlus** clients; for
 **MaxiGuard** it is attempted too, but because those run inside a Proton
 container it is best-effort - check the client's log (the output drawer) for a
 `[sroredirect]` line to confirm it took effect.
+
+**Favorites.** Proxy targets you use often (e.g. one per phBot instance) can
+be saved as favorites. Once there is at least one, clicking **Redirect** opens
+a quick menu instead of the form: pick a favorite to switch the client to it,
+**Off** to connect directly, **Custom / locale…** for the full form, or
+**Manage favorites…** to add, edit, reorder and remove them. The active entry
+has a check mark.
+
+![The Redirect quick menu](images/launch-redirect-menu.png)
+
+![Managing redirect favorites](images/redirect-favorites.png)
+
+**Several clients, several proxies.** The redirect is read when a client
+starts, so you can run several clients side by side, each through its own
+proxy: pick a favorite (e.g. *phBot 1*), start the client, pick the next one
+(*phBot 2*), start the next client. Every running client keeps
+the redirect it was started with, and clients without redirect connect
+directly. This needs all clients of that type (Plain / vSroPlus) to have been
+started by this version - if one was still started by an older version, close
+all of them once; the client's log says so if that is the case.
 
 **phBot** and the **phBot Manager** have their own tabs:
 
